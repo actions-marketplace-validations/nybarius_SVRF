@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -59,7 +60,7 @@ class Daemon:
                  rate_floor: int = 200, lock_path: Path | None = None, hold_label: str = "train:hold",
                  is_union: Callable[[str], bool] = lambda p: False, repair: bool = True, reland: bool = True,
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
-                 admission_watch: list[str] | None = None):
+                 admission_watch: list[str] | None = None, jobs: int = 1, memory=None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -74,6 +75,11 @@ class Daemon:
         # Paths every hold depends on whatever it changed: the environment its verdict ran in.
         self.admission_watch = list(admission_watch or [])
         self.history_verdict = history_verdict
+        # A slow admission command (one PR's package suite) must never block another
+        # PR's admission read: up to `jobs` heads are read at once, admitted by the same
+        # memory guard the gate uses (both can run the same heavy suite), the way
+        # `Train.round` already gates independent families concurrently.
+        self.jobs, self.memory = max(1, jobs), memory
 
     # ---- memory
 
@@ -129,6 +135,19 @@ class Daemon:
         if n not in summary["retry_later"]:
             summary["retry_later"].append(n)
         summary["reasons"][str(n)] = reason
+
+    def _read_admission(self, row: dict, base: str) -> tuple[dict | None, Exception | None]:
+        """One admission read, run on the executor: admitted by the memory guard the gate
+        also uses (the admission command can run the same heavy suite), so this and a
+        running gate never together exceed the host's reserved memory."""
+        head = row.get("headRefOid")
+        try:
+            if self.memory is not None:
+                with self.memory.admit():
+                    return self.admission(head, base), None
+            return self.admission(head, base), None
+        except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
+            return None, error
 
     def _tick(self) -> dict:
         summary = {"tick": "IDLE", "at": _stamp(self.clock), "admitted": [], "held": [], "held_unchanged": [],
@@ -189,33 +208,36 @@ class Daemon:
             self.save(state, summary)
             return summary
         admitted: list[int] = []
-        for row in candidates:
-            n = int(row["number"])
-            head = row.get("headRefOid")
-            try:
-                value = self.admission(head, base)
-            except ReadFailed as failure:
-                self._retry(summary, n, failure.reason)
-                continue
-            except Exception as error:  # a check that could not run is a read not made
-                self._retry(summary, n, f"ADMISSION_FAILED:{type(error).__name__}:{error}"[:200])
-                continue
-            state["held"].pop(str(n), None)
-            decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
-            residuals = list(value.get("residuals") or [])
-            if decision == "ADMIT":
-                admitted.append(n)
-            elif decision == "ALREADY_MERGED":
-                self.close_merged(row, base, state, summary)
-            elif decision == "REPAIR" and self.repair_enabled:
-                self.repair(row, cls, residuals, state, summary)
-            elif decision == "RELAND":
-                self.reland(row, cls, state, summary)
-            elif decision in ("HOLD", "REPAIR"):
-                self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                          extra=self._watch(base, list(value.get("changed") or [])))
-            else:
-                self._retry(summary, n, cls or "ADMISSION_UNREAD")
+        executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="admission")
+        try:
+            futures = {int(row["number"]): executor.submit(self._read_admission, row, base) for row in candidates}
+            for row in candidates:
+                n = int(row["number"])
+                value, failure = futures[n].result()
+                if failure is not None:
+                    if isinstance(failure, ReadFailed):
+                        self._retry(summary, n, failure.reason)
+                    else:  # a check that could not run is a read not made
+                        self._retry(summary, n, f"ADMISSION_FAILED:{type(failure).__name__}:{failure}"[:200])
+                    continue
+                state["held"].pop(str(n), None)
+                decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
+                residuals = list(value.get("residuals") or [])
+                if decision == "ADMIT":
+                    admitted.append(n)
+                elif decision == "ALREADY_MERGED":
+                    self.close_merged(row, base, state, summary)
+                elif decision == "REPAIR" and self.repair_enabled:
+                    self.repair(row, cls, residuals, state, summary)
+                elif decision == "RELAND":
+                    self.reland(row, cls, state, summary)
+                elif decision in ("HOLD", "REPAIR"):
+                    self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
+                              extra=self._watch(base, list(value.get("changed") or [])))
+                else:
+                    self._retry(summary, n, cls or "ADMISSION_UNREAD")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         summary["admitted"] = admitted
         if admitted:
             self.land(admitted, rows, by_number, state, summary)

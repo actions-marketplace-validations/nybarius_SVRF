@@ -331,18 +331,33 @@ class DaemonGitHub(FakeGitHub):
 
 
 class Admission:
-    """The admission verdict by head sha; a head it has no verdict for is MERGEABLE."""
+    """The admission verdict by head sha; a head it has no verdict for is MERGEABLE.
+    `delay` and `running`/`peak` let a test observe whether concurrent admission reads
+    actually overlap in wall time, the same shape as FakeGate's own peak tracking."""
 
-    def __init__(self, verdicts=None, failures=None):
+    def __init__(self, verdicts=None, failures=None, delay=0.0):
         self.verdicts = dict(verdicts or {})
         self.failures = dict(failures or {})
+        self.delay = delay
         self.calls = []
+        self.running = 0
+        self.peak = 0
+        self.lock = threading.Lock()
 
     def __call__(self, head, base):
-        self.calls.append((head, base))
-        if head in self.failures:
-            raise self.failures.pop(head)
-        return self.verdicts.get(head, {"verdict": "MERGEABLE", "residuals": []})
+        with self.lock:
+            self.calls.append((head, base))
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if head in self.failures:
+                raise self.failures.pop(head)
+            return self.verdicts.get(head, {"verdict": "MERGEABLE", "residuals": []})
+        finally:
+            with self.lock:
+                self.running -= 1
 
 
 def git(cwd, *args, env=None):

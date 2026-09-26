@@ -157,7 +157,9 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    on another branch. A stacked pull request waits for its parent and is retargeted to
    the base once the parent merges. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
-   admission command pass.
+   admission command pass. Up to `train.jobs` heads are read at once, each in its own
+   worktree, so one head whose admission command runs a slow suite never blocks the
+   others' admission or a later merge.
 3. **Families.** Read which pairs of heads conflict (git's own merge of each pair). Keep
    the largest set that pairwise does not conflict; conflicts only on union-merge files
    (changelogs, requirement lists, import indexes) do not count. Fold the kept heads onto
@@ -228,7 +230,7 @@ Unknown keys are refused.
 | `gate.failing_pattern` | `error\|FAIL\|Traceback` | which output lines to report for a red gate |
 | `gate.env` | `{}` | extra environment for gate commands |
 | `train.family_size` | `8` | pull requests per gated family |
-| `train.jobs` | `2` | families gated in parallel |
+| `train.jobs` | `2` | families gated in parallel, and also how many admission reads (candidates' `admission.command`) run at once, each in its own worktree and admitted by the same `gate.memory_gb`/`memory_reserve_gb` guard as a gate |
 | `train.max_rounds` | `3` | replanning rounds per tick |
 | `train.rate_floor` | `200` | pause while GitHub's remaining budget is below this |
 | `train.comment` | `true` | comment on merged pull requests |

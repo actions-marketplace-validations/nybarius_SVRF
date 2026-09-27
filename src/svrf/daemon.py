@@ -123,8 +123,9 @@ class Daemon:
             dropped = [n for n in numbers if state["held"].pop(str(n), None) is not None]
             summary = {"tick": "FORGOT", "at": _stamp(self.clock), "forgot": dropped}
             self.save(state, summary)
-            if self.demand is not None and not self.dry_run:
-                self.demand.released(self, numbers)
+            released = getattr(self.demand, "released", None)
+            if callable(released) and not self.dry_run:
+                released(self, numbers)
             return summary
 
     # ---- one round

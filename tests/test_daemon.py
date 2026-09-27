@@ -653,6 +653,40 @@ class WatchedPathRetry(unittest.TestCase):
         self.assertEqual(cfg.load(path).admission_watch, ["req.txt"])
 
 
+    def test_a_held_head_is_read_again_when_the_base_changes_what_its_checks_consumed(self):
+        """The hold's watch is what its failing checks consumed (the admission's `consumed` PATH
+        rows), not only the paths the pull request changed: a failing suite that reads lane 32
+        is read again when lane 32 lands, although the held head changed nothing there."""
+        repo = DaemonRepo([31, 32, 33])
+        gh = DaemonGitHub(repo)
+        admission = Admission({"h31": {"verdict": "HELD", "residuals": ["check:suites:tests/test_x.py:exit=1"], "changed": [],
+                                       "consumed": [{"id": "lane:32", "kind": "PATH"}, {"id": "dir:tests", "kind": "DIR"},
+                                                    {"id": "h31", "kind": "COMMIT"}]},
+                               "h32": {"verdict": "HELD", "residuals": ["check:y"]}})
+        d = daemon(repo, gh, FakeGate(repo), admission, self.tmp)
+        d.tick()
+        self.assertEqual(held_numbers(self.tmp), [31, 32])
+        state = json.loads((Path(self.tmp) / "state.json").read_text())
+        self.assertEqual(state["held"]["31"]["watch"], ["lane:32"])
+        d.tick()
+        self.assertEqual([h for h, _ in admission.calls].count("h31"), 1)
+        repo.move_head(32)
+        d.tick()
+        self.assertEqual(gh.merged, [33, 32])
+        d.tick()                                   # the base changed over what 31's check consumed: read again
+        self.assertEqual([h for h, _ in admission.calls].count("h31"), 2)
+
+    def test_the_watch_is_the_union_of_changed_and_consumed_paths(self):
+        repo = DaemonRepo([31])
+        gh = DaemonGitHub(repo)
+        admission = Admission({"h31": {"verdict": "HELD", "residuals": ["check:x"], "changed": ["lane:5"],
+                                       "consumed": [{"id": "lane:7", "kind": "PATH"}, {"id": "lane:5", "kind": "PATH"}]}})
+        d = daemon(repo, gh, FakeGate(repo), admission, self.tmp)
+        d.tick()
+        state = json.loads((Path(self.tmp) / "state.json").read_text())
+        self.assertEqual(state["held"]["31"]["watch"], ["lane:5", "lane:7"])
+
+
 def _string_lists(path: Path):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):

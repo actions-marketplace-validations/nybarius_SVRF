@@ -123,6 +123,8 @@ class Daemon:
             dropped = [n for n in numbers if state["held"].pop(str(n), None) is not None]
             summary = {"tick": "FORGOT", "at": _stamp(self.clock), "forgot": dropped}
             self.save(state, summary)
+            if self.demand is not None and not self.dry_run:
+                self.demand.released(self, numbers)
             return summary
 
     # ---- one round
@@ -197,7 +199,7 @@ class Daemon:
                     state["held"].pop(str(n), None)
             held = state["held"].get(str(n))
             contained = self._contained(base_sha, row)
-            self.round_inputs[n]["contained"] = contained
+            self.round_inputs[n].setdefault("contained", contained)
             decision, _ = rules.admission(row, held, self.watch_digest(held, row, base_now),
                                           carried=contained, base=self.base,
                                           hold_label=self.hold_label)
@@ -223,6 +225,17 @@ class Daemon:
             self.save(state, summary)
             return summary
         admitted: list[int] = []
+        watch = None
+        if self.admission_watch:
+            try:
+                watch = self.git.watch_digest(base, self.admission_watch)
+            except ReadFailed as failure:
+                watch = {"unobserved": failure.reason}
+        for row in candidates:
+            inputs = self.round_inputs[int(row["number"])]
+            inputs["admission_base"] = base
+            if self.admission_watch:
+                inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="admission")
         try:
             futures = {int(row["number"]): executor.submit(self._read_admission, row, base) for row in candidates}
@@ -380,7 +393,8 @@ class Daemon:
             return False
         try:
             return self.git.is_ancestor(head, base_sha)
-        except ReadFailed:
+        except ReadFailed as failure:
+            self.round_inputs.setdefault(int(row["number"]), {})["contained"] = {"unobserved": failure.reason}
             return False
 
     def close_merged(self, row: dict, base_sha: str, state: dict, summary: dict) -> None:

@@ -221,6 +221,7 @@ Unknown keys are refused.
 | --- | --- | --- |
 | `repo` | required | `owner/name` |
 | `base` | `"main"` | branch pull requests land on |
+| `demand_driver` | `""` | optional trusted Python `module:factory` selecting rounds under the existing owner lock |
 | `clone`, `state_dir` | under `~/.local/share/svrf` | the train's clone; its state, receipts, slots, logs, lock |
 | `gate.commands` | required | shell commands run in the folded tree; green iff all exit 0 |
 | `gate.setup` | `[]` | run first, under one lock shared by all slots (dependency caches) |
@@ -249,6 +250,24 @@ Unknown keys are refused.
 
 Gate commands see `SVRF_BASE`, `SVRF_COMMIT`, `SVRF_LABEL` and `SVRF_CHANGED_FILES` (a
 file listing the changed paths), so a gate can build only what changed.
+
+An explicit demand driver changes `run --once` into a drain of externally retained
+work. The factory receives `Config` and returns an object with `drain(owner)`.
+The driver runs inside the same owner lock as the default round; it can call
+`owner._tick(requested={12, 15}, changed={12: {"parent"}})` to limit candidates while
+preserving the full ancestry snapshot, admission, parallelism, holds and landing
+checks. `changed` accepts `base` and `parent` to invalidate ancestry memory. Exact
+round inputs are exposed in `owner.round_inputs`, including rows, parent reads,
+ancestry results and the watch digest measured before admission starts.
+
+The driver owns durable work retention, acknowledgement and wake integration. An
+empty drain should perform no discovery reads. An optional `released(owner, numbers)`
+hook is called after `forget` saves its state, under the same lock. Dry runs neither
+notify that hook nor authorize a driver to acknowledge work. Driver import or
+construction failures refuse startup; they never fall back to polling. This is a
+trusted local extension point, not a module name accepted from event payloads.
+Disable any ordinary timer or `watch` process when configuring an external wake
+source. With no driver configured, existing CLI behavior is unchanged.
 
 ## Compared with other merge queues
 

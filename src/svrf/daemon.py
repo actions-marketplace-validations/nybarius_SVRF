@@ -60,7 +60,7 @@ class Daemon:
                  rate_floor: int = 200, lock_path: Path | None = None, hold_label: str = "train:hold",
                  is_union: Callable[[str], bool] = lambda p: False, repair: bool = True, reland: bool = True,
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
-                 admission_watch: list[str] | None = None, jobs: int = 1, memory=None):
+                 admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -80,6 +80,8 @@ class Daemon:
         # memory guard the gate uses (both can run the same heavy suite), the way
         # `Train.round` already gates independent families concurrently.
         self.jobs, self.memory = max(1, jobs), memory
+        self.demand = demand
+        self.round_rows, self.round_inputs = {}, {}
 
     # ---- memory
 
@@ -121,6 +123,9 @@ class Daemon:
             dropped = [n for n in numbers if state["held"].pop(str(n), None) is not None]
             summary = {"tick": "FORGOT", "at": _stamp(self.clock), "forgot": dropped}
             self.save(state, summary)
+            released = getattr(self.demand, "released", None)
+            if callable(released) and not self.dry_run:
+                released(self, numbers)
             return summary
 
     # ---- one round
@@ -129,6 +134,8 @@ class Daemon:
         with owner_lock(self.lock_path) as owned:
             if not owned:
                 return {"tick": "LOCKED", "at": _stamp(self.clock)}
+            if self.demand is not None:
+                return self.demand.drain(self)
             return self._tick()
 
     def _retry(self, summary: dict, n: int, reason: str) -> None:
@@ -149,7 +156,8 @@ class Daemon:
         except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
             return None, error
 
-    def _tick(self) -> dict:
+    def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
+        self.round_rows, self.round_inputs = {}, {}
         summary = {"tick": "IDLE", "at": _stamp(self.clock), "admitted": [], "held": [], "held_unchanged": [],
                    "repaired": [], "would_repair": [], "retargeted": [], "would_retarget": [], "skipped": {},
                    "retry_later": [], "reasons": {}, "merged": [], "merged_elsewhere": [],
@@ -170,6 +178,7 @@ class Daemon:
             self.save(state, summary)
             return summary
         by_number = {int(r["number"]): r for r in rows}
+        self.round_rows = by_number
         for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"]):
             for n in [n for n in memory if int(n) not in by_number]:
                 del memory[n]
@@ -181,10 +190,19 @@ class Daemon:
         except ReadFailed:
             base_sha = None
         for n in sorted(by_number):
+            if requested is not None and n not in requested:
+                continue
             row = by_number[n]
+            self.round_inputs[n] = {"row": dict(row)}
+            if (changed or {}).get(n, set()) & {"base", "parent"}:
+                state["bases"].pop(str(n), None)
+                if state["held"].get(str(n), {}).get("reason") == "PARENT_CLOSED_UNMERGED":
+                    state["held"].pop(str(n), None)
             held = state["held"].get(str(n))
+            contained = self._contained(base_sha, row)
+            self.round_inputs[n].setdefault("contained", contained)
             decision, _ = rules.admission(row, held, self.watch_digest(held, row, base_now),
-                                          carried=self._contained(base_sha, row), base=self.base,
+                                          carried=contained, base=self.base,
                                           hold_label=self.hold_label)
             if decision == "ALREADY_MERGED":
                 self.close_merged(row, base_sha, state, summary)
@@ -208,6 +226,17 @@ class Daemon:
             self.save(state, summary)
             return summary
         admitted: list[int] = []
+        watch = None
+        if self.admission_watch:
+            try:
+                watch = self.git.watch_digest(base, self.admission_watch)
+            except ReadFailed as failure:
+                watch = {"unobserved": failure.reason}
+        for row in candidates:
+            inputs = self.round_inputs[int(row["number"])]
+            inputs["admission_base"] = base
+            if self.admission_watch:
+                inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="admission")
         try:
             futures = {int(row["number"]): executor.submit(self._read_admission, row, base) for row in candidates}
@@ -324,6 +353,9 @@ class Daemon:
         n = int(row["number"])
         head, base = row.get("headRefOid"), row.get("baseRefName")
         if base in heads:
+            self.round_inputs.setdefault(n, {})["parents"] = {base: [
+                {"number": r["number"], "state": "open", "merged_at": None}
+                for r in self.round_rows.values() if r.get("headRefName") == base]}
             summary["skipped"][str(n)] = "WAITING_PARENT"
             return
         memory = state["bases"].get(str(n))
@@ -332,6 +364,7 @@ class Daemon:
             return
         try:
             parents = self.gh.pulls_with_head(base)
+            self.round_inputs.setdefault(n, {})["parents"] = {base: parents}
         except ReadFailed as failure:
             self._retry(summary, n, f"PARENT:{failure.reason}")
             return
@@ -361,7 +394,8 @@ class Daemon:
             return False
         try:
             return self.git.is_ancestor(head, base_sha)
-        except ReadFailed:
+        except ReadFailed as failure:
+            self.round_inputs.setdefault(int(row["number"]), {})["contained"] = {"unobserved": failure.reason}
             return False
 
     def close_merged(self, row: dict, base_sha: str, state: dict, summary: dict) -> None:

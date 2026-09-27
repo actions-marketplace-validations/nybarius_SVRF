@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import importlib
 from pathlib import Path
 
 from . import history
 from .admission import Admission
-from .config import Config
+from .config import Config, ConfigError
 from .daemon import Daemon
 from .errors import ReadFailed
 from .gate import CommandGate, MemoryGuard
@@ -55,6 +56,15 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
         extra["clock"] = clock
     if sleep is not None:
         extra["sleep"] = sleep
+    if config.demand_driver:
+        try:
+            module, factory = config.demand_driver.split(":", 1)
+            demand = getattr(importlib.import_module(module), factory)(config)
+            if not callable(getattr(demand, "drain", None)):
+                raise TypeError("driver must provide drain(owner)")
+            extra["demand"] = demand
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            raise ConfigError(f"demand driver unavailable: {exc}") from exc
     return Daemon(git, github or RealGitHub(config.repo), gate, admission, state_dir=config.state_dir,
                   receipts=config.receipts, base=config.base, dry_run=dry_run, rate_floor=config.train.rate_floor,
                   lock_path=config.lock, hold_label=config.hold_label, admission_watch=config.admission_watch,

@@ -42,6 +42,13 @@ class Demand(unittest.TestCase):
         self.assertEqual(dict(self.gh.calls), before)
         self.assertEqual(self.admission.calls, [])
 
+    def test_release_notification_is_optional_and_runs_after_retained_state_is_saved(self):
+        self.assertEqual(self.owner.forget([1])['tick'], 'FORGOT')
+        observed = []
+        self.driver.released = lambda owner, numbers: observed.append((numbers, owner.load_state()['held']))
+        self.owner.forget([1, 2])
+        self.assertEqual(observed, [([1, 2], {})])
+
     def test_driver_runs_inside_the_existing_single_owner_lock(self):
         def check(owner):
             with patch('svrf.locks._inherited', return_value=False):

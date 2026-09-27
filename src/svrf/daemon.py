@@ -262,7 +262,7 @@ class Daemon:
                     self.reland(row, cls, state, summary)
                 elif decision in ("HOLD", "REPAIR"):
                     self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                              extra=self._watch(base, list(value.get("changed") or [])))
+                              extra=self._watch(base, self._consumed_paths(value)))
                 else:
                     self._retry(summary, n, cls or "ADMISSION_UNREAD")
         finally:
@@ -336,6 +336,18 @@ class Daemon:
         if value == held.get("watch_digest"):
             held["base_sha"] = base_now["sha"]      # the base moved elsewhere: nothing reopens
         return value
+
+    @staticmethod
+    def _consumed_paths(value: dict) -> list[str]:
+        """What a hold depends on: the paths the pull request changed and the paths its admission
+        checks consumed (the admission's `consumed` rows of kind PATH). A failing check's verdict is
+        a function of what it read, so the base moving over any of those is what reopens the hold,
+        never only a move over the pull request's own paths."""
+        paths = set(value.get("changed") or [])
+        for row in value.get("consumed") or []:
+            if isinstance(row, dict) and row.get("kind") == "PATH" and isinstance(row.get("id"), str) and row["id"]:
+                paths.add(row["id"])
+        return sorted(paths)
 
     def _watch(self, base: str | None, paths: list[str]) -> dict:
         digest = getattr(self.git, "watch_digest", None)

@@ -71,6 +71,8 @@ class Config:
     union_merge: list[str] = field(default_factory=list)
     repair: bool = True
     admission_command: str = ""
+    demand_driver: str = ""
+    admission_watch: list[str] = field(default_factory=list)
     gate: GateConfig = field(default_factory=GateConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
@@ -99,7 +101,7 @@ class Config:
 
 
 _SECTIONS = {"gate": GateConfig, "train": TrainConfig, "history": HistoryConfig, "ui": UiConfig}
-_TOP = {"repo", "base", "clone", "state_dir", "remote", "git_name", "git_email", "hold_label", "admission_command"}
+_TOP = {"repo", "base", "clone", "state_dir", "remote", "git_name", "git_email", "hold_label", "admission_command", "demand_driver"}
 
 
 def from_dict(value: dict, *, root: Path | None = None) -> Config:
@@ -124,8 +126,9 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     kwargs["union_merge"] = list(repair.get("union_merge") or [])
     kwargs["repair"] = bool(repair.get("enabled", True))
     admission = value.get("admission") or {}
-    if set(admission) - {"command"}:
-        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command'})}")
+    if set(admission) - {"command", "watch"}:
+        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch'})}")
+    kwargs["admission_watch"] = list(admission.get("watch") or [])
     if "command" in admission:
         kwargs["admission_command"] = admission["command"]
     for name, cls in _SECTIONS.items():

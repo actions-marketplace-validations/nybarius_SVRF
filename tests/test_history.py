@@ -8,6 +8,8 @@ import contextlib
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -213,6 +215,55 @@ class RepairPlumbing(Repo):
         head = self.commit("x")
         held = Admission(g, command="echo 'reland:REFUSED:UNORDERED'; echo 'also this line'; exit 1")(head, main)
         self.assertEqual(held["residuals"], ["reland:REFUSED:UNORDERED", "check:also this line"])
+
+
+class AdmissionConcurrency(Repo):
+    """Two admission reads for two different heads, run at once. Without a worktree pool
+    they would have to share the one clone's working tree and could not run at once
+    without one `git checkout` stepping on the other; with `pool=`/`slots=` each read
+    gets its own worktree, so two heavy admission commands genuinely overlap and the
+    shared clone's own working tree is never touched."""
+
+    def setUp(self):
+        super().setUp()
+        git(self.work, "checkout", "-q", "-b", "lane-a", self.base)
+        self.write("a.py", "a = 1\n")
+        self.head_a = self.commit("feat: a")
+        git(self.work, "checkout", "-q", "-b", "lane-b", self.base)
+        self.write("b.py", "b = 1\n")
+        self.head_b = self.commit("feat: b")
+        git(self.work, "checkout", "-q", "--detach", self.base)
+
+    def test_two_slow_admission_commands_overlap_each_in_its_own_worktree(self):
+        g = self.rg()
+        pool = self.tmp / "admission-pool"
+        command = 'git checkout -q --detach -f "$SVRF_HEAD" && sleep 0.2 && git rev-parse HEAD'
+        a = Admission(g, command=command, pool=pool, slots=2)
+        b = Admission(g, command=command, pool=pool, slots=2)
+        results: dict = {}
+        errors: list = []
+
+        def run(name, admission, head):
+            try:
+                results[name] = admission(head, self.base)
+            except Exception as error:  # noqa: BLE001 - surfaced via `errors` below
+                errors.append(error)
+
+        started = time.monotonic()
+        threads = [threading.Thread(target=run, args=("a", a, self.head_a)),
+                  threading.Thread(target=run, args=("b", b, self.head_b))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.monotonic() - started
+        self.assertFalse(errors, errors)
+        self.assertLess(elapsed, 0.35)
+        self.assertEqual(results["a"]["verdict"], "MERGEABLE")
+        self.assertEqual(results["b"]["verdict"], "MERGEABLE")
+        # the shared clone's own working tree was never checked out by either read
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(len([p for p in pool.iterdir() if p.is_dir()]), 2)
 
 
 class GlobSemantics(unittest.TestCase):

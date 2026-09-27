@@ -157,7 +157,9 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    on another branch. A stacked pull request waits for its parent and is retargeted to
    the base once the parent merges. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
-   admission command pass.
+   admission command pass. Up to `train.jobs` heads are read at once, each in its own
+   worktree, so one head whose admission command runs a slow suite never blocks the
+   others' admission or a later merge.
 3. **Families.** Read which pairs of heads conflict (git's own merge of each pair). Keep
    the largest set that pairwise does not conflict; conflicts only on union-merge files
    (changelogs, requirement lists, import indexes) do not count. Fold the kept heads onto
@@ -219,6 +221,7 @@ Unknown keys are refused.
 | --- | --- | --- |
 | `repo` | required | `owner/name` |
 | `base` | `"main"` | branch pull requests land on |
+| `demand_driver` | `""` | optional trusted Python `module:factory` selecting rounds under the existing owner lock |
 | `clone`, `state_dir` | under `~/.local/share/svrf` | the train's clone; its state, receipts, slots, logs, lock |
 | `gate.commands` | required | shell commands run in the folded tree; green iff all exit 0 |
 | `gate.setup` | `[]` | run first, under one lock shared by all slots (dependency caches) |
@@ -228,7 +231,7 @@ Unknown keys are refused.
 | `gate.failing_pattern` | `error\|FAIL\|Traceback` | which output lines to report for a red gate |
 | `gate.env` | `{}` | extra environment for gate commands |
 | `train.family_size` | `8` | pull requests per gated family |
-| `train.jobs` | `2` | families gated in parallel |
+| `train.jobs` | `2` | families gated in parallel, and also how many admission reads (candidates' `admission.command`) run at once, each in its own worktree and admitted by the same `gate.memory_gb`/`memory_reserve_gb` guard as a gate |
 | `train.max_rounds` | `3` | replanning rounds per tick |
 | `train.rate_floor` | `200` | pause while GitHub's remaining budget is below this |
 | `train.comment` | `true` | comment on merged pull requests |
@@ -240,12 +243,31 @@ Unknown keys are refused.
 | `history.reland` | `true` | re-land refused histories in order instead of holding them |
 | `history.tests`, `history.docs` | common globs | how paths are classified for the history check |
 | `admission.command` | `""` | extra admission check; exit 0 admits, 126/127 means "could not run" |
+| `admission.watch` | `[]` | paths every hold depends on (requirements, toolchain pins); a base change there rereads every hold |
 | `ui.pr_comments` | `true` | one living comment per pull request (see [docs/PR_SURFACE.md](docs/PR_SURFACE.md)) |
 | `ui.status_checks` | `true` | a `svrf` commit status on each candidate head |
 | `ui.dashboard_url` | `""` | optional: linked from the status as `target_url` |
 
 Gate commands see `SVRF_BASE`, `SVRF_COMMIT`, `SVRF_LABEL` and `SVRF_CHANGED_FILES` (a
 file listing the changed paths), so a gate can build only what changed.
+
+An explicit demand driver changes `run --once` into a drain of externally retained
+work. The factory receives `Config` and returns an object with `drain(owner)`.
+The driver runs inside the same owner lock as the default round; it can call
+`owner._tick(requested={12, 15}, changed={12: {"parent"}})` to limit candidates while
+preserving the full ancestry snapshot, admission, parallelism, holds and landing
+checks. `changed` accepts `base` and `parent` to invalidate ancestry memory. Exact
+round inputs are exposed in `owner.round_inputs`, including rows, parent reads,
+ancestry results and the watch digest measured before admission starts.
+
+The driver owns durable work retention, acknowledgement and wake integration. An
+empty drain should perform no discovery reads. An optional `released(owner, numbers)`
+hook is called after `forget` saves its state, under the same lock. Dry runs neither
+notify that hook nor authorize a driver to acknowledge work. Driver import or
+construction failures refuse startup; they never fall back to polling. This is a
+trusted local extension point, not a module name accepted from event payloads.
+Disable any ordinary timer or `watch` process when configuring an external wake
+source. With no driver configured, existing CLI behavior is unchanged.
 
 ## Compared with other merge queues
 

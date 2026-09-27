@@ -25,6 +25,7 @@ from fakes import ROOT, UNION, Admission, Clock, DaemonGitHub, DaemonRepo, FakeG
 from svrf import rules
 from svrf.daemon import Daemon
 from svrf.errors import RateLimited, ReadFailed
+from svrf.gate import MemoryGuard
 from svrf.github import RealGitHub, gh_argv
 from svrf.locks import owner_lock
 from svrf.train import Train
@@ -171,6 +172,32 @@ class Rounds(unittest.TestCase):
         self.assertEqual(gh.calls["graphql"], 1)
         self.assertEqual(len(admission.calls), 3)
         self.assertTrue(Path(out["receipt"]).is_file())
+
+    def test_admission_reads_overlap_up_to_jobs_a_slow_pr_never_blocks_the_rest(self):
+        repo = DaemonRepo([14, 15, 16, 17])
+        gh = DaemonGitHub(repo)
+        admission = Admission(delay=0.2)
+        out = daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=4).tick()
+        self.assertEqual(out["admitted"], [14, 15, 16, 17])
+        self.assertGreaterEqual(admission.peak, 2)
+        self.assertLessEqual(admission.peak, 4)
+
+    def test_admission_jobs_of_one_reads_serially(self):
+        repo = DaemonRepo([18, 19])
+        gh = DaemonGitHub(repo)
+        admission = Admission(delay=0.1)
+        daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=1).tick()
+        self.assertEqual(admission.peak, 1)
+
+    def test_the_memory_guard_shared_with_the_gate_serializes_admission_too(self):
+        import time as _time
+
+        repo = DaemonRepo([181, 182, 183])
+        gh = DaemonGitHub(repo)
+        admission = Admission(delay=0.1)
+        guard = MemoryGuard(need_gb=10, reserve_gb=8, available_gb=lambda: 20, sleep=lambda s: _time.sleep(0.01))
+        daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=3, memory=guard).tick()
+        self.assertEqual(admission.peak, 1)
 
     def test_skips_drafts_forks_other_bases_and_the_hold_label(self):
         repo = DaemonRepo([21, 22, 23, 24, 25])
@@ -606,6 +633,24 @@ class WatchedPathRetry(unittest.TestCase):
         self.assertEqual([h for h, _ in admission.calls].count("h31"), 1)
         d.tick()                                   # the base changed over 31's watch: read again
         self.assertEqual([h for h, _ in admission.calls].count("h31"), 2)
+
+    def test_a_held_head_is_read_again_when_the_base_changes_an_always_watched_path(self):
+        """The environment a verdict ran in (a requirements file, a toolchain pin) is part of
+        what every hold depended on, even when the pull request never touched it."""
+        repo = DaemonRepo([41, 42])
+        gh = DaemonGitHub(repo)
+        admission = Admission({"h41": {"verdict": "HELD", "residuals": ["check:x"], "changed": ["lane:41"]}})
+        d = daemon(repo, gh, FakeGate(repo), admission, self.tmp, admission_watch=["lane:42"])
+        d.tick()                                   # 41 held, 42 lands
+        self.assertEqual(held_numbers(self.tmp), [41])
+        d.tick()                                   # the base changed over the always-watched path
+        self.assertEqual([h for h, _ in admission.calls].count("h41"), 2)
+
+    def test_admission_watch_is_read_from_the_config(self):
+        from svrf import config as cfg
+        path = Path(self.tmp) / "svrf.toml"
+        path.write_text('repo = "o/r"\n[gate]\ncommands = ["true"]\n[admission]\ncommand = "true"\nwatch = ["req.txt"]\n', encoding="utf-8")
+        self.assertEqual(cfg.load(path).admission_watch, ["req.txt"])
 
 
 def _string_lists(path: Path):

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import importlib
 from pathlib import Path
 
 from . import history
 from .admission import Admission
-from .config import Config
+from .config import Config, ConfigError
 from .daemon import Daemon
 from .errors import ReadFailed
 from .gate import CommandGate, MemoryGuard
@@ -42,8 +43,12 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
                        env=config.gate.env)
     kind = kind_of(config)
     prefixes = tuple(config.history.refactor_prefixes)
+    # A dedicated worktree pool (never the gate's own `config.worktrees` slots) so a
+    # concurrent admission read and a concurrent gate can never fight over the same
+    # slot directory.
     admission = Admission(git, order=config.history.order, kind=kind, refactor_prefixes=prefixes,
-                          command=config.admission_command)
+                          command=config.admission_command, pool=Path(config.worktrees) / "admission",
+                          slots=config.train.jobs)
     memory = MemoryGuard(need_gb=config.gate.memory_gb, reserve_gb=config.gate.memory_reserve_gb) \
         if config.gate.memory_gb else None
     extra = {}
@@ -51,9 +56,19 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
         extra["clock"] = clock
     if sleep is not None:
         extra["sleep"] = sleep
+    if config.demand_driver:
+        try:
+            module, factory = config.demand_driver.split(":", 1)
+            demand = getattr(importlib.import_module(module), factory)(config)
+            if not callable(getattr(demand, "drain", None)):
+                raise TypeError("driver must provide drain(owner)")
+            extra["demand"] = demand
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            raise ConfigError(f"demand driver unavailable: {exc}") from exc
     return Daemon(git, github or RealGitHub(config.repo), gate, admission, state_dir=config.state_dir,
                   receipts=config.receipts, base=config.base, dry_run=dry_run, rate_floor=config.train.rate_floor,
-                  lock_path=config.lock, hold_label=config.hold_label, is_union=union, repair=config.repair,
+                  lock_path=config.lock, hold_label=config.hold_label, admission_watch=config.admission_watch,
+                  is_union=union, repair=config.repair, jobs=config.train.jobs, memory=memory,
                   # history.reland alone gates this: reland_class only ever returns a class
                   # from a `history:REFUSED:` residual (the built-in tests-first check,
                   # order != "off") or a `reland:REFUSED:` one an admission.command reports

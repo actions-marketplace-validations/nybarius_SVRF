@@ -18,21 +18,31 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 from typing import Callable
 
 from . import history, rules
 from .errors import ReadFailed
+from .locks import SlotPool
 from .redact import redact
 
 UNAVAILABLE_EXITS = (126, 127)
 
 
 class Admission:
+    """`pool`/`slots`: when given, the admission command runs in its own worktree slot
+    (the same shape as the gate's `CommandGate`) instead of the clone's single shared
+    working tree, so concurrent admission reads for different heads never race each
+    other's `git checkout`. Without a pool the command runs directly in `git.root`,
+    exactly as before -- the historical single-threaded callers (`replay`) need no
+    worktree of their own."""
+
     def __init__(self, git, *, order: str = "off", kind: Callable[[str], str] | None = None,
                  refactor_prefixes: tuple[str, ...] = ("refactor", "perf"), command: str = "",
-                 timeout: float = 600):
+                 timeout: float = 600, pool: Path | str | None = None, slots: int = 1):
         self.git, self.order, self.kind = git, order, kind
         self.refactor_prefixes, self.command, self.timeout = refactor_prefixes, command, timeout
+        self.pool = SlotPool(Path(pool), slots) if pool is not None else None
 
     def __call__(self, head: str, base: str) -> dict:
         if self.git.is_ancestor(head, base):
@@ -52,9 +62,29 @@ class Admission:
         return {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
 
     def _command(self, head: str, base: str) -> list[str]:
-        env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(self.git.root)}
+        if self.pool is None:
+            return self._run_command(head, base, self.git.root)
+        slot = self.pool.acquire()
         try:
-            done = subprocess.run(["bash", "-c", self.command], cwd=str(self.git.root), env=env,
+            return self._run_command(head, base, self._slot_root(slot))
+        finally:
+            self.pool.release(slot)
+
+    def _slot_root(self, slot: Path) -> Path:
+        """The slot's own worktree of `git.root`, created once and reused: a `git
+        worktree` shares the object database, so no fetch is needed and every commit
+        the shared clone already has is checked out-able here too."""
+        if not (slot / ".git").exists():
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "-C", str(self.git.root), "worktree", "prune"], capture_output=True)
+            subprocess.run(["git", "-C", str(self.git.root), "worktree", "add", "-q", "--detach", "-f",
+                            str(slot), "HEAD"], check=True, capture_output=True)
+        return slot
+
+    def _run_command(self, head: str, base: str, root: Path) -> list[str]:
+        env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root)}
+        try:
+            done = subprocess.run(["bash", "-c", self.command], cwd=str(root), env=env,
                                   capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")

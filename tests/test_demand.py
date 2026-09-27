@@ -44,7 +44,7 @@ class Demand(unittest.TestCase):
 
     def test_driver_runs_inside_the_existing_single_owner_lock(self):
         def check(owner):
-            with patch('svrf.locks.inherited', return_value=False):
+            with patch('svrf.locks._inherited', return_value=False):
                 with owner_lock(owner.lock_path) as acquired:
                     self.assertFalse(acquired)
             return {'tick': 'QUIESCENT'}

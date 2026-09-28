@@ -202,6 +202,36 @@ class RepairPlumbing(Repo):
         with self.assertRaises(ReadFailed):
             Admission(g, command="definitely-not-a-command-svrf")(head, main)
 
+    def test_a_timed_out_admission_command_leaves_no_orphan_behind(self):
+        """The command runs `bash -c`, and bash starts the real work (uv, python, pytest) as
+        children. A timeout that kills bash alone leaves them running: they keep the host's cores,
+        every later admission read slows under them and times out in turn, and the train reads
+        ADMISSION_COMMAND_TIMEOUT round after round for a head whose intake would pass. The
+        command runs in its own session and the timeout kills that whole process group."""
+        import os
+        import signal
+        import time
+        g = self.rg()
+        main = g.main_sha()
+        git(self.work, "checkout", "-q", "--detach", main)
+        self.write("x.py", "x = 1\n")
+        head = self.commit("x")
+        pid_file = Path(self.work) / "child.pid"
+        command = f"sleep 30 & echo $! > {pid_file}; wait"
+        with self.assertRaises(ReadFailed) as raised:
+            Admission(g, command=command, timeout=0.5)(head, main)
+        self.assertEqual(str(raised.exception), "ADMISSION_COMMAND_TIMEOUT")
+        child = int(pid_file.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(child, signal.SIGKILL)
+            self.fail(f"the command's child {child} outlived the timeout")
+
     def test_the_admission_command_can_report_its_own_order_only_refusal_for_reland(self):
         # A command that classifies commit order itself (rather than relying on the
         # built-in tests-first check) reports it under `reland:REFUSED:<class>`, one of

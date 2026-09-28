@@ -134,7 +134,8 @@ def run(config, found: list[Reconstructed], *, base: str | None = None, gate: bo
         kind = kind_of(config)
         admission_check = Admission(git, order=config.history.order, kind=kind,
                                     refactor_prefixes=tuple(config.history.refactor_prefixes),
-                                    command=config.admission_command)
+                                    command=config.admission_command,
+                                    timeout=config.admission_timeout_minutes * 60)
         admission: dict[int, dict] = {}
         for item in found:
             try:

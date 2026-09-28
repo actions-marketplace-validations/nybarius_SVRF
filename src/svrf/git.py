@@ -117,8 +117,14 @@ class RealGit:
 
     def merge_preview(self, a: str, b: str) -> dict:
         """git's own merge of two commits, without union resolution: CLEAN with its tree,
-        CONFLICT with the conflicted paths, or FAILED."""
-        done = self._run("merge-tree", "--write-tree", "--name-only", "--no-messages", a, b)
+        CONFLICT with the conflicted paths, or FAILED.
+
+        The attributes are read from `a` (the base side of every real call), never from
+        whatever this clone happens to have checked out: `git merge-tree` otherwise reads
+        .gitattributes from the checkout, which a train clone never keeps aligned with
+        either side of the merge, so a merge=nym path is missed and reported as an
+        ordinary text conflict."""
+        done = self._run("-c", f"attr.tree={a}", "merge-tree", "--write-tree", "--name-only", "--no-messages", a, b)
         if done.returncode == 0:
             return {"status": "CLEAN", "tree": done.stdout.split("\n", 1)[0].strip(), "conflicts": []}
         if done.returncode == 1:
@@ -155,7 +161,9 @@ class RealGit:
                 return Step("CLEAN", commit=head, tree=self.tree(head))
             if self.is_ancestor(head, acc):
                 return Step("CLEAN", commit=acc, tree=self.tree(acc))
-            done = self._run("merge-tree", "--write-tree", head, acc)
+            # Same attribute-source fix as `merge_preview`: read .gitattributes from `acc`
+            # (the base/theirs side), never from this clone's checkout.
+            done = self._run("-c", f"attr.tree={acc}", "merge-tree", "--write-tree", head, acc)
             if done.returncode not in (0, 1):
                 return Step("FAILED", reason=f"MERGE_TREE_FAILED:{done.returncode}")
             lines = done.stdout.split("\n")

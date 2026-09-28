@@ -439,6 +439,42 @@ class RealGitIdentity(unittest.TestCase):
         chosen, out = rules.choose_families([1, 2], read["conflicts"], read["unreadable"], PathSet([UNION]))
         self.assertEqual((chosen, out), ([1, 2], {}))
 
+    def _driver_pair(self):
+        """Two commits diverging from a common ancestor that declares a custom merge
+        driver on `driveme.txt`, with this clone left checked out on `work/l2` (from
+        `setUp`), which never carries that `.gitattributes` at all. `git merge-tree`
+        must read the driver from the merge arguments, never from whatever happens to
+        be checked out."""
+        git(self.work, "config", "merge.testdriver.driver", "true")
+        git(self.work, "checkout", "-q", "-b", "attr/common", "origin/main")
+        (self.work / ".gitattributes").write_text("driveme.txt merge=testdriver\n")
+        (self.work / "driveme.txt").write_text("orig\n")
+        git(self.work, "add", ".")
+        git(self.work, "commit", "-qm", "declare the driver")
+        common = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "checkout", "-q", "-b", "attr/a", common)
+        (self.work / "driveme.txt").write_text("A\n")
+        git(self.work, "commit", "-qam", "A")
+        a = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "checkout", "-q", "-b", "attr/b", common)
+        (self.work / "driveme.txt").write_text("B\n")
+        git(self.work, "commit", "-qam", "B")
+        b = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "checkout", "-q", "work/l2")
+        return a, b
+
+    def test_merge_preview_reads_the_driver_from_its_base_argument_not_the_checkout(self):
+        g = RealGit(self.work, union=PathSet([UNION]))
+        a, b = self._driver_pair()
+        preview = g.merge_preview(a, b)
+        self.assertEqual(preview["status"], "CLEAN")
+
+    def test_union_step_reads_the_driver_from_acc_not_the_checkout(self):
+        g = RealGit(self.work, union=PathSet([UNION]))
+        a, b = self._driver_pair()
+        step = g.union_step(a, b, "preview")
+        self.assertEqual(step.status, "CLEAN")
+
 
 if __name__ == "__main__":
     unittest.main()

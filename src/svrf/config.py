@@ -71,6 +71,7 @@ class Config:
     union_merge: list[str] = field(default_factory=list)
     repair: bool = True
     admission_command: str = ""
+    admission_timeout_minutes: float = 10
     demand_driver: str = ""
     admission_watch: list[str] = field(default_factory=list)
     gate: GateConfig = field(default_factory=GateConfig)
@@ -126,11 +127,16 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     kwargs["union_merge"] = list(repair.get("union_merge") or [])
     kwargs["repair"] = bool(repair.get("enabled", True))
     admission = value.get("admission") or {}
-    if set(admission) - {"command", "watch"}:
-        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch'})}")
+    if set(admission) - {"command", "watch", "timeout_minutes"}:
+        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes'})}")
     kwargs["admission_watch"] = list(admission.get("watch") or [])
     if "command" in admission:
         kwargs["admission_command"] = admission["command"]
+    if "timeout_minutes" in admission:
+        minutes = admission["timeout_minutes"]
+        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+            raise ConfigError("[admission] timeout_minutes must be a positive number of minutes")
+        kwargs["admission_timeout_minutes"] = float(minutes)
     for name, cls in _SECTIONS.items():
         section = value.get(name) or {}
         fields = set(cls.__dataclass_fields__)

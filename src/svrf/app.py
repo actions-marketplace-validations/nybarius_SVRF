@@ -48,7 +48,7 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
     # slot directory.
     admission = Admission(git, order=config.history.order, kind=kind, refactor_prefixes=prefixes,
                           command=config.admission_command, pool=Path(config.worktrees) / "admission",
-                          slots=config.train.jobs)
+                          slots=config.train.jobs, timeout=config.admission_timeout_minutes * 60)
     memory = MemoryGuard(need_gb=config.gate.memory_gb, reserve_gb=config.gate.memory_reserve_gb) \
         if config.gate.memory_gb else None
     extra = {}

@@ -29,6 +29,19 @@ from .redact import redact
 UNAVAILABLE_EXITS = (126, 127)
 
 
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Terminate the command's whole process group and reap it; a group already gone is fine."""
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, ValueError):
+        proc.kill()
+
+
 class Admission:
     """`pool`/`slots`: when given, the admission command runs in its own worktree slot
     (the same shape as the gate's `CommandGate`) instead of the clone's single shared
@@ -83,11 +96,17 @@ class Admission:
 
     def _run_command(self, head: str, base: str, root: Path) -> list[str]:
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root)}
+        # The command runs in its own session: a timeout kills the whole process group (bash and
+        # the uv/python/pytest children it started), never bash alone with its children left
+        # running on the host to slow every later read into the same timeout.
+        proc = subprocess.Popen(["bash", "-c", self.command], cwd=str(root), env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
-            done = subprocess.run(["bash", "-c", self.command], cwd=str(root), env=env,
-                                  capture_output=True, text=True, timeout=self.timeout)
+            stdout, stderr = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
+            _kill_group(proc)
             raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
+        done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
             raise ReadFailed(f"ADMISSION_COMMAND_UNAVAILABLE:{done.returncode}")
         if done.returncode == 0:

@@ -40,6 +40,16 @@ class Config(unittest.TestCase):
         with self.assertRaises(ConfigError):
             from_dict({**MINIMAL, "ui": {"comments": True}})
 
+    def test_the_admission_timeout_is_configured_in_minutes_and_defaults_to_ten(self):
+        """An admission command that reads a large head (the intake runs every suite the head
+        touches) needs longer than the class default under a loaded host; the operator sets it
+        in [admission] like the gate's timeout, in minutes."""
+        self.assertEqual(from_dict(MINIMAL).admission_timeout_minutes, 10)
+        c = from_dict({**MINIMAL, "admission": {"command": "true", "timeout_minutes": 45}})
+        self.assertEqual(c.admission_timeout_minutes, 45)
+        with self.assertRaises(ConfigError):
+            from_dict({**MINIMAL, "admission": {"command": "true", "timeout_minutes": "soon"}})
+
     def test_reland_is_wired_from_the_admission_command_even_with_the_built_in_check_off(self):
         # history.order == "off" (the default) used to force reland_enabled False no
         # matter what history.reland said, on the assumption that a reland-eligible

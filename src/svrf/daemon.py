@@ -21,7 +21,8 @@ A round:
    head is read next round. A history-order refusal (if that check is on) is re-landed:
    the head's final tree is rebuilt as tests -> code -> docs commits on the base, pushed
    to `<branch>-ordered`, and a new pull request supersedes the original, provided the
-   rebuilt tree is identical and the new history passes the check. Anything else is held
+   rebuilt tree is identical and the new history passes the original admission check
+   before publication. Anything else is held
    with its residual lines. A failed read is retried next round.
 5. The admitted heads go to the batched train (`Train.run`, reusing the round's snapshot).
 6. `<state_dir>/state.json` (the held memory) and `<state_dir>/held.json` (every held pull
@@ -477,7 +478,8 @@ class Daemon:
         """Rebuild the head's final tree (after the usual union merge of the base) as an
         ordered history on the base, push it to `<branch>-ordered` (never the original
         branch), and open a pull request that supersedes the original. Held instead if the
-        rebuilt tree differs or the new history still fails the order check."""
+        rebuilt tree differs or the original admission still refuses it. The
+        constructor's history classifier never substitutes for that reader."""
         n = int(row["number"])
         head, ref, title = row.get("headRefOid"), row.get("headRefName"), row.get("title", "")
         if self.dry_run:
@@ -505,13 +507,44 @@ class Daemon:
         final = result.commits[-1] if result.commits else base_sha
         ordered_ref = f"{ref}-ordered"
         try:
-            self.git.push_branch(final, ordered_ref)
+            if self.git.tree(final) != step.tree:
+                self.hold(row, "RELAND_TREE_MISMATCH", state, summary, cls=cls)
+                return
             verdict = self.history_verdict(base_sha, final) if self.history_verdict else "CLEAN"
         except ReadFailed as failure:
             self._retry(summary, n, f"RELAND:{failure.reason}")
             return
         if verdict != "CLEAN":
             self.hold(row, f"RELAND_{verdict}", state, summary, cls=cls)
+            return
+        # Read the rebuilt occurrence under the same admission object and base
+        # that refused the original. In particular, an external command can use
+        # a stricter classifier than history_verdict. Check before any push or
+        # PR effect; an identical tree alone says nothing about this read.
+        value, error = self._read_admission({**row, "headRefOid": final}, base_sha)
+        if error is not None:
+            reason = error.reason if isinstance(error, ReadFailed) else f"ADMISSION_FAILED:{type(error).__name__}"
+            self._retry(summary, n, f"RELAND:{reason}")
+            return
+        if not isinstance(value, dict):
+            self._retry(summary, n, "RELAND:ADMISSION_UNOBSERVED")
+            return
+        summary.setdefault("repair_checks", []).append({
+            "number": n, "base": base_sha, "head": final, "tree": step.tree,
+            "admission": value})
+        residuals = list(value.get("residuals") or [])
+        if value.get("verdict") == "HELD" and residuals:
+            self.hold(row, "RELAND_ADMISSION_HELD", state, summary, failing=residuals, cls=cls,
+                      extra={**self._watch(base_sha, self._consumed_paths(value)), "repair_head": final})
+            return
+        if (value.get("verdict") != "MERGEABLE" or residuals
+                or (value.get("admission") or {}).get("complete", True) is not True):
+            self._retry(summary, n, "RELAND:ADMISSION_UNOBSERVED")
+            return
+        try:
+            self.git.push_branch(final, ordered_ref)
+        except ReadFailed as failure:
+            self._retry(summary, n, f"RELAND:{failure.reason}")
             return
         body = (f"Supersedes #{n}: the same final tree, with its history ordered tests, code, docs.\n\n"
                 + _strip_trailers(row.get("body") or ""))

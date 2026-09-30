@@ -251,6 +251,18 @@ Unknown keys are refused.
 Gate commands see `SVRF_BASE`, `SVRF_COMMIT`, `SVRF_LABEL` and `SVRF_CHANGED_FILES` (a
 file listing the changed paths), so a gate can build only what changed.
 
+Admission commands can write dependency evidence to the per-invocation file
+`SVRF_ADMISSION_READS`. The optional JSON document has `schema:
+"svrf.admission-reads/1"`, `head` and `base` matching `SVRF_HEAD` and `SVRF_BASE`,
+and a `consumed` array of `{ "kind": "PATH", "id": "src/helper.py" }` rows.
+`CODE` also names a repository-relative file; `DIR` uses `dir:fixtures` for a
+directory dependency. `COMMIT` rows are retained as ancestry. File paths may name
+currently absent files. A hold watches these dependencies together with its
+changed paths and `admission.watch`; unrelated base changes leave it quiet.
+Malformed or mismatched evidence causes a retry instead of a retained hold.
+Commands that do not write the file keep their existing behavior. Each invocation
+gets its own temporary file, including concurrent admission checks.
+
 An explicit demand driver changes `run --once` into a drain of externally retained
 work. The factory receives `Config` and returns an object with `drain(owner)`.
 The driver runs inside the same owner lock as the default round; it can call

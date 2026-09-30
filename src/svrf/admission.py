@@ -16,9 +16,11 @@ never holds the pull request for it.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from . import history, rules
@@ -27,6 +29,50 @@ from .locks import SlotPool
 from .redact import redact
 
 UNAVAILABLE_EXITS = (126, 127)
+
+
+def _unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("DUPLICATE_KEY")
+        result[key] = value
+    return result
+
+
+def _read_basis(path: Path, head: str, base: str) -> list[dict] | None:
+    """Optional command evidence; a supplied but unreadable basis cannot seed a hold."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None  # Existing commands have no read-evidence protocol.
+    except (OSError, UnicodeError) as error:
+        raise ReadFailed("ADMISSION_READS_UNAVAILABLE") from error
+    try:
+        value = json.loads(text, object_pairs_hook=_unique)
+        if (not isinstance(value, dict) or value.get("schema") != "svrf.admission-reads/1"
+                or value.get("head") != head or value.get("base") != base
+                or not isinstance(value.get("consumed"), list)):
+            raise ValueError("OCCURRENCE")
+        for row in value["consumed"]:
+            if (not isinstance(row, dict) or set(row) != {"kind", "id"}
+                    or row["kind"] not in ("PATH", "DIR", "CODE", "COMMIT")
+                    or not isinstance(row["id"], str) or not row["id"]
+                    or any(ord(c) < 32 for c in row["id"])):
+                raise ValueError("ROW")
+            if row["kind"] == "COMMIT":
+                continue
+            name = row["id"]
+            if row["kind"] == "DIR":
+                if not name.startswith("dir:"):
+                    raise ValueError("DIRECTORY")
+                name = name[4:]
+            if (not name or name.startswith(":") or PurePosixPath(name).is_absolute()
+                    or ".." in PurePosixPath(name).parts):
+                raise ValueError("PATH")
+        return value["consumed"]
+    except (ValueError, TypeError, RecursionError) as error:
+        raise ReadFailed("ADMISSION_READS_INVALID") from error
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -70,11 +116,16 @@ class Admission:
             result = history.verdict(self.git, base, head, self.kind, self.refactor_prefixes)
             if result != "CLEAN":
                 residuals.append(f"history:{result}")
+        consumed = None
         if self.command:
-            residuals += self._command(head, base)
-        return {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
+            lines, consumed = self._command(head, base)
+            residuals += lines
+        value = {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
+        if consumed is not None:
+            value["consumed"] = consumed
+        return value
 
-    def _command(self, head: str, base: str) -> list[str]:
+    def _command(self, head: str, base: str) -> tuple[list[str], list[dict] | None]:
         if self.pool is None:
             return self._run_command(head, base, self.git.root)
         slot = self.pool.acquire()
@@ -94,8 +145,14 @@ class Admission:
                             str(slot), "HEAD"], check=True, capture_output=True)
         return slot
 
-    def _run_command(self, head: str, base: str, root: Path) -> list[str]:
-        env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root)}
+    def _run_command(self, head: str, base: str, root: Path) -> tuple[list[str], list[dict] | None]:
+        with tempfile.TemporaryDirectory(prefix="svrf-admission-reads-") as scratch:
+            return self._execute_command(head, base, root, Path(scratch) / "reads.json")
+
+    def _execute_command(self, head: str, base: str, root: Path,
+                         reads: Path) -> tuple[list[str], list[dict] | None]:
+        env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
+               "SVRF_ADMISSION_READS": str(reads)}
         # The command runs in its own session: a timeout kills the whole process group (bash and
         # the uv/python/pytest children it started), never bash alone with its children left
         # running on the host to slow every later read into the same timeout.
@@ -109,8 +166,9 @@ class Admission:
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
             raise ReadFailed(f"ADMISSION_COMMAND_UNAVAILABLE:{done.returncode}")
+        consumed = _read_basis(reads, head, base)
         if done.returncode == 0:
-            return []
+            return [], consumed
         output = redact(done.stdout + done.stderr, env)
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         # A line the command already shaped as a reland refusal (`reland:REFUSED:<class>`)
@@ -119,4 +177,4 @@ class Admission:
         # diagnostic and is wrapped under `check:`.
         residuals = [line[:200] if rules.RELAND_LINE.match(line[:200]) else f"check:{line[:200]}"
                      for line in lines[-5:]]
-        return residuals or [f"check:exit={done.returncode}"]
+        return residuals or [f"check:exit={done.returncode}"], consumed

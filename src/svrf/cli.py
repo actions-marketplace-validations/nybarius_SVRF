@@ -81,14 +81,24 @@ def status(config) -> dict:
     return out
 
 
-def _last_receipt(config) -> dict | None:
+def _last_receipt(config, number: int | None = None, tick: dict | None = None) -> dict | None:
     receipts = sorted(Path(config.receipts).glob("train-*.json"))
     if not receipts:
         return None
-    try:
-        return json.loads(receipts[-1].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    selected = (tick or {}).get("receipts") or []
+    # An automatic round may produce several groups. Read only its listed local
+    # files, and let a later explicit train supersede it as before.
+    receipts = [p for p in receipts if str(p) in selected] if str(receipts[-1]) in selected else receipts[-1:]
+    for path in reversed(receipts):
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (number is None or any(m.get("number") == number for m in receipt.get("merges", []))
+                or any(number in f.get("prs", []) for f in receipt.get("families", []))
+                or str(number) in receipt.get("out", {})):
+            return receipt
+    return None
 
 
 def why(config, number: int) -> dict:
@@ -106,7 +116,7 @@ def why(config, number: int) -> dict:
                    failing=held.get("failing", [])[:24], paths=held.get("paths", []), since=held.get("at"),
                    next_step=NEXT_STEPS.get(reason, DEFAULT_NEXT_STEP))
         return out
-    last = _last_receipt(config)
+    last = _last_receipt(config, number, state.get("last_tick"))
     if last:
         merged = {int(m["number"]) for m in last.get("merges", []) if m.get("identity")}
         if number in merged:

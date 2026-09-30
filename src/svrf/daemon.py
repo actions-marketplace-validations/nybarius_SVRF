@@ -24,7 +24,8 @@ A round:
    rebuilt tree is identical and the new history passes the original admission check
    before publication. Anything else is held
    with its residual lines. A failed read is retried next round.
-5. The admitted heads go to the batched train (`Train.run`, reusing the round's snapshot).
+5. Completed admission groups go to the batched train (`Train.run`, reusing the round's
+   snapshot) while other admissions continue. A stopped train stops later groups too.
 6. `<state_dir>/state.json` (the held memory) and `<state_dir>/held.json` (every held pull
    request with its head, reason, failing lines and paths) are rewritten.
 """
@@ -33,7 +34,7 @@ from __future__ import annotations
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
@@ -68,6 +69,8 @@ class Daemon:
         self.base = base
         self.clock, self.sleep = clock, sleep
         self.train_options = {"max_rounds": 3, **(train_options or {})}
+        if memory is not None:
+            self.train_options["memory"] = memory
         self.dry_run, self.rate_floor = dry_run, rate_floor
         self.lock_path = Path(lock_path).expanduser() if lock_path else self.state_dir / "svrf.lock"
         self.hold_label, self.is_union = hold_label, is_union
@@ -110,7 +113,7 @@ class Daemon:
     def save(self, state: dict, summary: dict) -> None:
         if self.dry_run:
             return
-        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt") if k in summary}
+        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt", "receipts", "stopped") if k in summary}
         self._write(self.state_path, state)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
@@ -163,7 +166,7 @@ class Daemon:
                    "repaired": [], "would_repair": [], "retargeted": [], "would_retarget": [], "skipped": {},
                    "retry_later": [], "reasons": {}, "merged": [], "merged_elsewhere": [],
                    "would_close_merged": [], "held_rows": [], "relanded": [], "would_reland": [], "out": [],
-                   "receipt": None, "dry_run": self.dry_run}
+                   "receipt": None, "receipts": [], "stopped": False, "dry_run": self.dry_run}
         state = self.load_state()
         try:
             budget = self.gh.rate_limit()
@@ -240,37 +243,51 @@ class Daemon:
                 inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="admission")
         try:
-            futures = {int(row["number"]): executor.submit(self._read_admission, row, base) for row in candidates}
-            for row in candidates:
-                n = int(row["number"])
-                value, failure = futures[n].result()
-                if failure is not None:
-                    if isinstance(failure, ReadFailed):
-                        self._retry(summary, n, failure.reason)
-                    else:  # a check that could not run is a read not made
-                        self._retry(summary, n, f"ADMISSION_FAILED:{type(failure).__name__}:{failure}"[:200])
-                    continue
-                state["held"].pop(str(n), None)
-                decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
-                residuals = list(value.get("residuals") or [])
-                if decision == "ADMIT":
-                    admitted.append(n)
-                elif decision == "ALREADY_MERGED":
-                    self.close_merged(row, base, state, summary)
-                elif decision == "REPAIR" and self.repair_enabled:
-                    self.repair(row, cls, residuals, state, summary)
-                elif decision == "RELAND":
-                    self.reland(row, cls, state, summary)
-                elif decision in ("HOLD", "REPAIR"):
-                    self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                              extra=self._watch(base, self._consumed_paths(value)))
-                else:
-                    self._retry(summary, n, cls or "ADMISSION_UNREAD")
+            pending = {executor.submit(self._read_admission, row, base): row for row in candidates}
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                batch: list[int] = []
+                # Keep every result already available in the same group. Slow reads
+                # do not order other heads; the train still owns folding and landing.
+                for future in sorted(done, key=lambda f: int(pending[f]["number"])):
+                    row = pending.pop(future)
+                    n = int(row["number"])
+                    value, failure = future.result()
+                    if failure is not None:
+                        if isinstance(failure, ReadFailed):
+                            self._retry(summary, n, failure.reason)
+                        else:  # a check that could not run is a read not made
+                            self._retry(summary, n, f"ADMISSION_FAILED:{type(failure).__name__}:{failure}"[:200])
+                        continue
+                    state["held"].pop(str(n), None)
+                    decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
+                    residuals = list(value.get("residuals") or [])
+                    if decision == "ADMIT":
+                        admitted.append(n)
+                        batch.append(n)
+                    elif summary["stopped"]:
+                        self._retry(summary, n, "TRAIN_STOPPED")
+                    elif decision == "ALREADY_MERGED":
+                        self.close_merged(row, base, state, summary)
+                    elif decision == "REPAIR" and self.repair_enabled:
+                        self.repair(row, cls, residuals, state, summary)
+                    elif decision == "RELAND":
+                        self.reland(row, cls, state, summary)
+                    elif decision in ("HOLD", "REPAIR"):
+                        self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
+                                  extra=self._watch(base, self._consumed_paths(value)))
+                    else:
+                        self._retry(summary, n, cls or "ADMISSION_UNREAD")
+                summary["admitted"] = sorted(admitted)
+                if batch:
+                    if summary["stopped"]:
+                        for n in batch:
+                            self._retry(summary, n, "TRAIN_STOPPED")
+                    else:
+                        self.land(batch, rows, by_number, state, summary)
+                self.save(state, summary)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
-        summary["admitted"] = admitted
-        if admitted:
-            self.land(admitted, rows, by_number, state, summary)
         self.save(state, summary)
         return summary
 
@@ -279,9 +296,11 @@ class Daemon:
                       dry_run=self.dry_run, is_union=self.is_union, **self.train_options)
         receipt = train.run(admitted, rows=rows)
         summary["receipt"] = str(train.path)
-        summary["merged"] = [m["number"] for m in receipt["merges"] if m.get("identity")]
+        summary["receipts"].append(str(train.path))
+        summary["stopped"] = summary["stopped"] or receipt.get("stopped", False)
+        summary["merged"].extend(m["number"] for m in receipt["merges"] if m.get("identity"))
         summary["api_calls"] = receipt.get("api_calls")
-        summary["gates"] = len([g for g in receipt["gates"] if "reused" not in g])
+        summary["gates"] = summary.get("gates", 0) + len([g for g in receipt["gates"] if "reused" not in g])
         repaired: set[int] = set()
         for hold in receipt["holds"]:
             n = int(hold["number"])
@@ -310,7 +329,7 @@ class Daemon:
                 self.repair(by_number[n], "STALE_BASE", ["github:NOT_MERGEABLE"], state, summary)
             elif n not in summary["merged"] and n not in repaired:
                 self._retry(summary, n, entry.get("reason") or "")
-        summary["out"] = sorted(int(n) for n in receipt.get("out", {}))
+        summary["out"] = sorted(set(summary["out"]) | {int(n) for n in receipt.get("out", {})})
 
     # ---- what a hold depended on
 
@@ -341,13 +360,17 @@ class Daemon:
     @staticmethod
     def _consumed_paths(value: dict) -> list[str]:
         """What a hold depends on: the paths the pull request changed and the paths its admission
-        checks consumed (the admission's `consumed` rows of kind PATH). A failing check's verdict is
+        checks consumed (PATH, checker CODE, and conservative DIR rows). A failing check's verdict is
         a function of what it read, so the base moving over any of those is what reopens the hold,
         never only a move over the pull request's own paths."""
         paths = set(value.get("changed") or [])
         for row in value.get("consumed") or []:
-            if isinstance(row, dict) and row.get("kind") == "PATH" and isinstance(row.get("id"), str) and row["id"]:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+                continue
+            if row.get("kind") in ("PATH", "CODE"):
                 paths.add(row["id"])
+            elif row.get("kind") == "DIR" and row["id"].startswith("dir:") and row["id"][4:]:
+                paths.add(row["id"][4:])
         return sorted(paths)
 
     def _watch(self, base: str | None, paths: list[str]) -> dict:

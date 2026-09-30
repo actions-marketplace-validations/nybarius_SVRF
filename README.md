@@ -158,8 +158,10 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    the base once the parent merges. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
    admission command pass. Up to `train.jobs` heads are read at once, each in its own
-   worktree, so one head whose admission command runs a slow suite never blocks the
-   others' admission or a later merge.
+   worktree. Completed heads reach the train while other admissions continue; all
+   results available together stay in one batch. Admission and gating share the memory
+   limit, so a gate still waits when the host has no capacity. Uneven completion can
+   produce smaller batches and more gate runs, in exchange for earlier progress.
 3. **Families.** Read which pairs of heads conflict (git's own merge of each pair). Keep
    the largest set that pairwise does not conflict; conflicts only on union-merge files
    (changelogs, requirement lists, import indexes) do not count. Fold the kept heads onto
@@ -250,6 +252,18 @@ Unknown keys are refused.
 
 Gate commands see `SVRF_BASE`, `SVRF_COMMIT`, `SVRF_LABEL` and `SVRF_CHANGED_FILES` (a
 file listing the changed paths), so a gate can build only what changed.
+
+Admission commands can write dependency evidence to the per-invocation file
+`SVRF_ADMISSION_READS`. The optional JSON document has `schema:
+"svrf.admission-reads/1"`, `head` and `base` matching `SVRF_HEAD` and `SVRF_BASE`,
+and a `consumed` array of `{ "kind": "PATH", "id": "src/helper.py" }` rows.
+`CODE` also names a repository-relative file; `DIR` uses `dir:fixtures` for a
+directory dependency. `COMMIT` rows are retained as ancestry. File paths may name
+currently absent files. A hold watches these dependencies together with its
+changed paths and `admission.watch`; unrelated base changes leave it quiet.
+Malformed or mismatched evidence causes a retry instead of a retained hold.
+Commands that do not write the file keep their existing behavior. Each invocation
+gets its own temporary file, including concurrent admission checks.
 
 An explicit demand driver changes `run --once` into a drain of externally retained
 work. The factory receives `Config` and returns an object with `drain(owner)`.

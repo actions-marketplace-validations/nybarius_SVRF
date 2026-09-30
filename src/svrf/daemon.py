@@ -341,13 +341,17 @@ class Daemon:
     @staticmethod
     def _consumed_paths(value: dict) -> list[str]:
         """What a hold depends on: the paths the pull request changed and the paths its admission
-        checks consumed (the admission's `consumed` rows of kind PATH). A failing check's verdict is
+        checks consumed (PATH, checker CODE, and conservative DIR rows). A failing check's verdict is
         a function of what it read, so the base moving over any of those is what reopens the hold,
         never only a move over the pull request's own paths."""
         paths = set(value.get("changed") or [])
         for row in value.get("consumed") or []:
-            if isinstance(row, dict) and row.get("kind") == "PATH" and isinstance(row.get("id"), str) and row["id"]:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+                continue
+            if row.get("kind") in ("PATH", "CODE"):
                 paths.add(row["id"])
+            elif row.get("kind") == "DIR" and row["id"].startswith("dir:") and row["id"][4:]:
+                paths.add(row["id"][4:])
         return sorted(paths)
 
     def _watch(self, base: str | None, paths: list[str]) -> dict:

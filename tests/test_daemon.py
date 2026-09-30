@@ -667,7 +667,7 @@ class WatchedPathRetry(unittest.TestCase):
         d.tick()
         self.assertEqual(held_numbers(self.tmp), [31, 32])
         state = json.loads((Path(self.tmp) / "state.json").read_text())
-        self.assertEqual(state["held"]["31"]["watch"], ["lane:32"])
+        self.assertEqual(state["held"]["31"]["watch"], ["lane:32", "tests"])
         d.tick()
         self.assertEqual([h for h, _ in admission.calls].count("h31"), 1)
         repo.move_head(32)

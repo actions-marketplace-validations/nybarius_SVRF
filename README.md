@@ -158,8 +158,10 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    the base once the parent merges. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
    admission command pass. Up to `train.jobs` heads are read at once, each in its own
-   worktree, so one head whose admission command runs a slow suite never blocks the
-   others' admission or a later merge.
+   worktree. Completed heads reach the train while other admissions continue; all
+   results available together stay in one batch. Admission and gating share the memory
+   limit, so a gate still waits when the host has no capacity. Uneven completion can
+   produce smaller batches and more gate runs, in exchange for earlier progress.
 3. **Families.** Read which pairs of heads conflict (git's own merge of each pair). Keep
    the largest set that pairwise does not conflict; conflicts only on union-merge files
    (changelogs, requirement lists, import indexes) do not count. Fold the kept heads onto

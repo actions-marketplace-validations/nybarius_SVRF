@@ -65,7 +65,8 @@ class Train:
                  memory=None, clock=time.time, sleep=time.sleep, rate_floor: int = 200, rate_retries: int = 6,
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
-                 pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = ""):
+                 pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
+                 hold_label: str = "train:hold"):
         self.git, self.gh, self.gate = git, github, gate
         self.jobs, self.family_size, self.memory = max(1, jobs), max(1, family_size), memory
         self.clock, self.sleep = clock, sleep
@@ -73,6 +74,7 @@ class Train:
         self.poll_seconds, self.poll_tries = poll_seconds, poll_tries
         self.max_rounds, self.dry_run, self.comment = max_rounds, dry_run, comment
         self.is_union = is_union
+        self.hold_label = hold_label
         self.pr_comments, self.status_checks, self.dashboard_url = pr_comments, status_checks, dashboard_url
         self.lock = threading.RLock()
         self.rows: dict[int, dict] = {}
@@ -305,6 +307,17 @@ class Train:
         family["status"] = "PREFIX_LANDED_UNGATED" if index else status
         self._save()
 
+    def _publication_withheld(self, pull: dict, family: dict, index: int) -> bool:
+        labels = pull.get("labels")
+        if (type(labels) is not list
+                or any(type(row) is not dict or type(row.get("name")) is not str for row in labels)):
+            raise ReadFailed("PULL_LABELS_UNOBSERVED")
+        if any(row["name"] == self.hold_label for row in labels):
+            self.retry_later(family["steps"][index]["number"], f"HOLD_LABEL:{self.hold_label}")
+            self._stop_family(family, index, "WITHHELD")
+            return True
+        return False
+
     def land_family(self, family: dict, expected: str, gate_seconds: float = 0.0) -> tuple[bool, list[int]]:
         """Land the family's pull requests in order, checking every landed tree against the
         planned one. Returns whether the whole family landed and what to requeue."""
@@ -321,6 +334,8 @@ class Train:
                     self._stop_family(family, index, "REQUEUED")
                     return False, rest
                 pull = self.call(self.gh.pull, n)
+                if self._publication_withheld(pull, family, index):
+                    return False, rest[1:]
                 if pull.get("head_sha") != row["head_sha"]:
                     self.alert("HEAD_MOVED", family=family["id"], number=n, snapshot=row["head_sha"],
                                observed=pull.get("head_sha"))
@@ -335,6 +350,8 @@ class Train:
                 if prepared.commit != row["head_sha"]:
                     self.git.push_branch(prepared.commit, row["head_ref"])
                 pull = self._await_mergeable(n, prepared.commit)
+                if self._publication_withheld(pull, family, index):
+                    return False, rest[1:]
                 if pull.get("draft"):
                     self.call(self.gh.ready, n)
                 merged = self.call(self.gh.merge, n, prepared.commit)

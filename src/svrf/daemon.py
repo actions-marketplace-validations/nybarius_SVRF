@@ -118,7 +118,14 @@ class Daemon:
     def save(self, state: dict, summary: dict) -> None:
         if self.dry_run:
             return
-        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at") if k in summary}
+        state["last_tick"] = {k: summary[k] for k in (
+            "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
+            "admitted", "held", "merged", "skipped", "retry_later", "reasons",
+        ) if k in summary}
+        state["last_tick"]["admission_sources"] = {
+            str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
+            for n, inputs in self.round_inputs.items() if "admission_base" in inputs
+        }
         self._write(self.state_path, state)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
@@ -303,7 +310,8 @@ class Daemon:
 
     def land(self, admitted: list[int], rows: list[dict], by_number: dict, state: dict, summary: dict) -> None:
         train = Train(self.git, self.gh, self.gate, receipts=self.receipts, clock=self.clock, sleep=self.sleep,
-                      dry_run=self.dry_run, is_union=self.is_union, **self.train_options)
+                      dry_run=self.dry_run, is_union=self.is_union,
+                      **{**self.train_options, "hold_label": self.hold_label})
         receipt = train.run(admitted, rows=rows)
         summary["receipt"] = str(train.path)
         summary["receipts"].append(str(train.path))

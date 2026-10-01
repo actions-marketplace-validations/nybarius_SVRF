@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from .merge_family import maximum_family
+
 # rule name -> the Lean theorem that states it, and where the code enforces it
 RULES: dict[str, dict[str, str]] = {
     "family-fold": {"lean": "fold", "check": "Train.plan"},
@@ -114,8 +116,7 @@ def choose_families(numbers: list[int], conflicts: list[dict], unreadable: list[
     for pair in unreadable:
         edges.append((pair["a"], pair["b"]))
         paths[frozenset((pair["a"], pair["b"]))] = {f"UNREADABLE:{pair.get('reason', '')}"}
-    rows = families(numbers, edges)
-    chosen = rows[0] if rows else []
+    chosen = maximum_family(numbers, edges)
     out: dict[int, dict] = {}
     for n in numbers:
         if n in chosen:

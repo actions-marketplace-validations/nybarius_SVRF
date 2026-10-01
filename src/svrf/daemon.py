@@ -33,18 +33,23 @@ A round:
 from __future__ import annotations
 
 import json
+import math
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
 from . import rules
-from .errors import ReadFailed
+from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
 from .train import Train
 
 STATE_SCHEMA = "svrf.state/1"
 HELD_SCHEMA = "svrf.held/1"
+
+
+def _observed_reset(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
 def _stamp(clock) -> str:
@@ -113,7 +118,7 @@ class Daemon:
     def save(self, state: dict, summary: dict) -> None:
         if self.dry_run:
             return
-        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt", "receipts", "stopped") if k in summary}
+        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at") if k in summary}
         self._write(self.state_path, state)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
@@ -174,11 +179,16 @@ class Daemon:
             if low:
                 kind, value = low[0]
                 summary.update(tick="RATE_FLOOR", reason=f"RATE_FLOOR:{kind}:{value.get('remaining')}<{self.rate_floor}")
+                resets = [v.get("reset") for _, v in low if _observed_reset(v.get("reset"))]
+                if resets:
+                    summary["retry_at"] = max(resets)
                 self.save(state, summary)
                 return summary
             rows = self.gh.snapshot()
         except ReadFailed as failure:
             summary.update(tick="RETRY", reason=failure.reason)
+            if isinstance(failure, RateLimited) and _observed_reset(failure.reset):
+                summary["retry_at"] = failure.reset
             self.save(state, summary)
             return summary
         by_number = {int(r["number"]): r for r in rows}

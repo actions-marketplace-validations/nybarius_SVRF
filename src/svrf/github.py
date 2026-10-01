@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 
-from .errors import ReadFailed, classify_gh_failure
+from .errors import RateLimited, ReadFailed, classify_gh_failure
 
 
 def gh_argv(args: list[str], repo: str) -> list[str]:
@@ -34,6 +35,8 @@ class RealGitHub:
 
     def _gh(self, args: list[str], kind: str | None) -> str:
         argv = gh_argv(args, self.repo)
+        if args and args[0] == "api" and args != ["api", "rate_limit"]:
+            argv.append("--include")
         if kind:
             self.calls[kind] += 1
         try:
@@ -42,9 +45,28 @@ class RealGitHub:
             raise ReadFailed("GH_TIMEOUT:60") from exc
         except OSError as exc:
             raise ReadFailed("GH_UNAVAILABLE:" + type(exc).__name__) from exc
+        body = done.stdout.replace("\r\n", "\n")
+        headers = {}
+        while body.startswith("HTTP/") and "\n\n" in body:
+            block, body = body.split("\n\n", 1)
+            headers = {name.lower().strip(): value.strip()
+                       for line in block.splitlines()[1:] if ":" in line
+                       for name, value in [line.split(":", 1)]}
         if done.returncode != 0:
-            classify_gh_failure(done.returncode, done.stderr or done.stdout)
-        return done.stdout
+            try:
+                classify_gh_failure(done.returncode, done.stderr or body)
+            except RateLimited as failure:
+                resets = []
+                retry = headers.get("retry-after", "")
+                reset = headers.get("x-ratelimit-reset", "")
+                if retry.isascii() and retry.isdigit():
+                    resets.append(time.time() + int(retry))
+                if (headers.get("x-ratelimit-remaining") == "0"
+                        and reset.isascii() and reset.isdigit()):
+                    resets.append(float(reset))
+                failure.reset = max(resets) if resets else None
+                raise
+        return body
 
     def rate_limit(self) -> dict:
         try:

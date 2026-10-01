@@ -107,7 +107,8 @@ class LocalHub:
         self._publish(number)
         return {"number": number, "head_sha": self._sha(pr["head_ref"]), "head_ref": pr["head_ref"],
                 "mergeable": self._mergeable(pr) if pr["state"] == "open" else None,
-                "state": pr["state"], "draft": pr["draft"]}
+                "state": pr["state"], "draft": pr["draft"],
+                "labels": [{"name": name} for name in pr["labels"]]}
 
     def pulls_with_head(self, branch: str) -> list[dict]:
         self.calls["rest"] += 1

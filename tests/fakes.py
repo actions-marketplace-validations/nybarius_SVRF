@@ -141,7 +141,8 @@ class FakeGitHub:
     def pull(self, number):
         self.calls["rest"] += 1
         return {"number": number, "head_sha": self.repo.branches[f"pr-{number}"],
-                "mergeable": True, "state": "open", "draft": number in self.drafts}
+                "mergeable": True, "state": "open", "draft": number in self.drafts,
+                "labels": [{"name": name} for name in getattr(self, "labels", {}).get(number, [])]}
 
     def ready(self, number):
         self.calls["graphql"] += 1

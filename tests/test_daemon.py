@@ -715,7 +715,7 @@ class ExplicitRepository(unittest.TestCase):
             if argv[1:3] == ["api", "rate_limit"]:
                 text = json.dumps({"resources": {"graphql": {"remaining": 1, "reset": 2},
                                                  "core": {"remaining": 1, "reset": 2}}})
-            elif argv[1:3] == ["pr", "list"]:
+            elif "pulls?state=open" in " ".join(argv):
                 text = "[]"
             elif "pulls/7/merge" in " ".join(argv):
                 text = json.dumps({"merged": True, "sha": "m"})
@@ -736,7 +736,8 @@ class ExplicitRepository(unittest.TestCase):
             gh.rate_limit()
             gh.snapshot()
             gh.pull(7)
-            gh.ready(7)
+            with self.assertRaises(ReadFailed):
+                gh.ready(7)
             gh.merge(7, "h")
             gh.comment(7, "x")
             gh.close(7)
@@ -744,7 +745,7 @@ class ExplicitRepository(unittest.TestCase):
             gh.pulls_with_head("b")
         finally:
             module.subprocess.run = original
-        self.assertEqual(len(seen), 9)
+        self.assertEqual(len(seen), 8)
         for argv in seen:
             self.assertEqual(argv[0], "gh")
             bound = ("--repo" in argv and argv[argv.index("--repo") + 1] == REPO) or \

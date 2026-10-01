@@ -92,3 +92,11 @@ def test_draft_transition_reports_missing_rest_capability_without_any_call():
     with patch("svrf.github.subprocess.run") as run, pytest.raises(ReadFailed):
         RealGitHub("o/r").ready(1)
     run.assert_not_called()
+
+
+def test_github_calls_have_a_bounded_wait_and_timeout_is_a_read_failure():
+    def timeout(argv, **kwargs):
+        assert kwargs.get("timeout") == 60
+        raise subprocess.TimeoutExpired(argv, 60)
+    with patch("svrf.github.subprocess.run", timeout), pytest.raises(ReadFailed, match="TIMEOUT"):
+        RealGitHub("o/r").snapshot()

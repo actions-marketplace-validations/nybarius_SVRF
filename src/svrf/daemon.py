@@ -118,7 +118,14 @@ class Daemon:
     def save(self, state: dict, summary: dict) -> None:
         if self.dry_run:
             return
-        state["last_tick"] = {k: summary[k] for k in ("tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at") if k in summary}
+        state["last_tick"] = {k: summary[k] for k in (
+            "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
+            "admitted", "held", "merged", "skipped", "retry_later", "reasons",
+        ) if k in summary}
+        state["last_tick"]["admission_sources"] = {
+            str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
+            for n, inputs in self.round_inputs.items() if "admission_base" in inputs
+        }
         self._write(self.state_path, state)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],

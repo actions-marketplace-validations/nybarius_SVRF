@@ -118,7 +118,8 @@ class RealGitHub:
     def pull(self, number: int) -> dict:
         value = json.loads(self._gh(["api", f"repos/{self.repo}/pulls/{number}"], "rest"))
         return {"number": number, "head_sha": value["head"]["sha"], "head_ref": value["head"]["ref"],
-                "mergeable": value.get("mergeable"), "state": value.get("state"), "draft": value.get("draft")}
+                "mergeable": value.get("mergeable"), "state": value.get("state"), "draft": value.get("draft"),
+                "labels": value.get("labels")}
 
     def merge_commit(self, number: int) -> str | None:
         """The commit GitHub made when this pull request was merged, or None (never

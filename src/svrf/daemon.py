@@ -303,7 +303,8 @@ class Daemon:
 
     def land(self, admitted: list[int], rows: list[dict], by_number: dict, state: dict, summary: dict) -> None:
         train = Train(self.git, self.gh, self.gate, receipts=self.receipts, clock=self.clock, sleep=self.sleep,
-                      dry_run=self.dry_run, is_union=self.is_union, **self.train_options)
+                      dry_run=self.dry_run, is_union=self.is_union,
+                      **{**self.train_options, "hold_label": self.hold_label})
         receipt = train.run(admitted, rows=rows)
         summary["receipt"] = str(train.path)
         summary["receipts"].append(str(train.path))

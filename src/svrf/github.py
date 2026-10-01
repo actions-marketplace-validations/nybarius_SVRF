@@ -1,12 +1,13 @@
 """GitHub through the `gh` CLI, every call counted and every call naming its repository.
 
-One GraphQL list per round (`gh pr list`); REST for everything else. The rate budget
-read (`gh api rate_limit`) is free and is the one call that names no repository.
+Complete paginated REST snapshots; no GraphQL budget or operation is consumed.
+The rate budget read (`gh api rate_limit`) names no repository.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 from .errors import ReadFailed, classify_gh_failure
@@ -35,19 +36,62 @@ class RealGitHub:
         argv = gh_argv(args, self.repo)
         if kind:
             self.calls[kind] += 1
-        done = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise ReadFailed("GH_TIMEOUT:60") from exc
+        except OSError as exc:
+            raise ReadFailed("GH_UNAVAILABLE:" + type(exc).__name__) from exc
         if done.returncode != 0:
             classify_gh_failure(done.returncode, done.stderr or done.stdout)
         return done.stdout
 
     def rate_limit(self) -> dict:
-        resources = json.loads(self._gh(["api", "rate_limit"], None))["resources"]
-        return {k: {"remaining": resources[k]["remaining"], "reset": resources[k]["reset"]}
-                for k in ("graphql", "core")}
+        try:
+            core = json.loads(self._gh(["api", "rate_limit"], None))["resources"]["core"]
+            if any(type(core[k]) is not int or core[k] < 0 for k in ("remaining", "reset")):
+                raise ValueError("invalid core budget")
+            return {"core": {k: core[k] for k in ("remaining", "reset")}}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReadFailed("RATE_BUDGET_UNOBSERVED") from exc
 
     def snapshot(self) -> list[dict]:
-        return json.loads(self._gh(["pr", "list", "--repo", self.repo, "--state", "open", "--limit", str(self.limit),
-                                    "--json", self.SNAPSHOT_FIELDS], "graphql"))
+        if type(self.limit) is not int or self.limit < 1:
+            raise ReadFailed("SNAPSHOT_LIMIT_INVALID")
+        rows, seen, page = [], set(), 1
+        while True:
+            try:
+                values = json.loads(self._gh([
+                    "api", f"repos/{self.repo}/pulls?state=open&per_page=100&page={page}"], "rest"))
+                if type(values) is not list or len(values) > 100:
+                    raise ValueError("invalid page")
+                for value in values:
+                    number = value["number"]
+                    head, base = value["head"], value["base"]
+                    if (type(number) is not int or number < 1 or number in seen
+                            or type(value["draft"]) is not bool or value["state"] != "open"
+                            or type(value["title"]) is not str
+                            or (value["body"] is not None and type(value["body"]) is not str)
+                            or type(value["labels"]) is not list
+                            or any(type(label["name"]) is not str for label in value["labels"])
+                            or any(type(v) is not str or not v for v in
+                                   (head["ref"], head["sha"], base["ref"],
+                                    head["repo"]["full_name"], base["repo"]["full_name"]))
+                            or not re.fullmatch(r"[0-9a-f]{40}", head["sha"])):
+                        raise ValueError("invalid or repeated source row")
+                    seen.add(number)
+                    rows.append({"number": number, "title": value["title"], "body": value["body"],
+                                 "isDraft": value["draft"], "headRefName": head["ref"],
+                                 "headRefOid": head["sha"], "baseRefName": base["ref"],
+                                 "labels": value["labels"],
+                                 "isCrossRepository": head["repo"]["full_name"] != base["repo"]["full_name"]})
+                if len(rows) > self.limit:
+                    raise ReadFailed("SNAPSHOT_LIMIT_EXCEEDED")
+                if len(values) < 100:
+                    return rows
+                page += 1
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReadFailed("SNAPSHOT_UNOBSERVED") from exc
 
     def pull(self, number: int) -> dict:
         value = json.loads(self._gh(["api", f"repos/{self.repo}/pulls/{number}"], "rest"))
@@ -71,7 +115,9 @@ class RealGitHub:
         self._gh(["api", "-X", "PATCH", f"repos/{self.repo}/pulls/{number}", "-f", f"base={base}"], "rest")
 
     def ready(self, number: int) -> None:
-        self._gh(["pr", "ready", str(number), "--repo", self.repo], "graphql")
+        # GitHub exposes this transition through GraphQL only. Preserve the
+        # missing effect capability; do not spend a prohibited transport budget.
+        raise ReadFailed("DRAFT_TRANSITION_REQUIRES_GRAPHQL")
 
     def merge(self, number: int, sha: str) -> str:
         """Merge with a merge commit, pinned to `sha`: GitHub refuses if the head moved."""

@@ -49,6 +49,7 @@ from typing import Callable
 from . import pr_surface
 from .errors import RateLimited, ReadFailed
 from .rules import choose_families, chunk
+from .tree_provider import reason_class
 
 SCHEMA = "svrf.receipt/1"
 
@@ -66,7 +67,7 @@ class Train:
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
-                 hold_label: str = "train:hold"):
+                 hold_label: str = "train:hold", tree_provider=None):
         self.git, self.gh, self.gate = git, github, gate
         self.jobs, self.family_size, self.memory = max(1, jobs), max(1, family_size), memory
         self.clock, self.sleep = clock, sleep
@@ -75,6 +76,7 @@ class Train:
         self.max_rounds, self.dry_run, self.comment = max_rounds, dry_run, comment
         self.is_union = is_union
         self.hold_label = hold_label
+        self.tree_provider = tree_provider
         self.pr_comments, self.status_checks, self.dashboard_url = pr_comments, status_checks, dashboard_url
         self.lock = threading.RLock()
         self.rows: dict[int, dict] = {}
@@ -97,6 +99,8 @@ class Train:
             "requested": [], "prs": {}, "pairs": None, "out": {}, "rounds": [], "families": [], "gates": [],
             "merges": [], "holds": [], "retry_later": [], "pending": [], "alerts": [], "rate_waits": [],
             "api_calls": {}, "surface": dict(self._surface_calls), "stopped": False}
+        if tree_provider is not None:
+            self.receipt["tree_provider"] = {"consulted": 0, "provider": 0, "git": 0, "reasons": {}}
 
     # ---- receipt
 
@@ -229,6 +233,35 @@ class Train:
             self._wait_until(float(value.get("reset", self.clock() + 300)),
                              f"RATE_FLOOR:{kind}:{value.get('remaining')}<{self.rate_floor}")
 
+    # ---- the merge step
+
+    def merge_step(self, acc: str, head: str, message: str):
+        """The union step, as always. With a tree provider, a step that git merged into a
+        new commit is also offered to the provider; its tree is used only when it is
+        git's own tree. Returns the step and, with a provider, what to record about it."""
+        step = self.git.union_step(acc, head, message)
+        if self.tree_provider is None or step.status != "CLEAN" or step.commit in (acc, head):
+            return step, {}
+        try:
+            proposed, reason = self.tree_provider.propose(head, acc)
+        except Exception as error:  # a provider failure is never a landing failure
+            proposed, reason = None, f"PROVIDER_FAILED:{type(error).__name__}"
+        if reason is None and proposed != step.tree:
+            reason = "PROVIDER_MISMATCH"
+        record = {"tree_source": "git" if reason else "provider"}
+        if reason:
+            record["tree_provider"] = reason
+            if proposed is not None:
+                record["proposed_tree"] = proposed
+        with self.lock:
+            counts = self.receipt["tree_provider"]
+            counts["consulted"] += 1
+            counts[record["tree_source"]] += 1
+            if reason:
+                key = reason_class(reason)
+                counts["reasons"][key] = counts["reasons"].get(key, 0) + 1
+        return step, record
+
     # ---- planning and gating
 
     def plan(self, numbers: list[int], base: str, parent: str | None = None) -> dict | None:
@@ -237,7 +270,7 @@ class Train:
         acc, steps = base, []
         for n in numbers:
             row = self.rows[n]
-            step = self.git.union_step(acc, row["head_sha"], f"train preview #{n}")
+            step, record = self.merge_step(acc, row["head_sha"], f"train preview #{n}")
             if step.status == "CONFLICT":
                 self.hold(n, "CONFLICT", paths=step.conflicts)
             elif step.status != "CLEAN":
@@ -245,7 +278,7 @@ class Train:
             elif step.commit == acc:
                 self.retry_later(n, "ALREADY_MERGED")
             else:
-                steps.append({"number": n, "commit": step.commit, "tree": step.tree})
+                steps.append({"number": n, "commit": step.commit, "tree": step.tree, **record})
                 acc = step.commit
         if not steps:
             return None
@@ -341,7 +374,7 @@ class Train:
                                observed=pull.get("head_sha"))
                     self._stop_family(family, index, "REQUEUED")
                     return False, rest
-                prepared = self.git.union_step(current, row["head_sha"], f"Merge base into {row['head_ref']}")
+                prepared, record = self.merge_step(current, row["head_sha"], f"Merge base into {row['head_ref']}")
                 if prepared.status != "CLEAN" or prepared.tree != planned["tree"]:
                     self.alert("PREPARE_DIVERGED", family=family["id"], number=n, status=prepared.status,
                                planned=planned["tree"], prepared=prepared.tree)
@@ -366,14 +399,14 @@ class Train:
                 self.retry_later(n, f"LANDED_TREE_UNREAD:{unread}")
                 self._add("merges", {"number": n, "family": family["id"], "head": prepared.commit, "merge": merged,
                                      "parents": [], "gated_tree": planned["tree"], "observed_tree": None,
-                                     "identity": None, "at": self.clock()})
+                                     "identity": None, "at": self.clock(), **record})
                 family["status"] = "LANDED_TREE_UNREAD"
                 self._save()
                 return False, [s["number"] for s in steps[index + 1:]]
             identity = observed == planned["tree"]
             self._add("merges", {"number": n, "family": family["id"], "head": prepared.commit, "merge": merged,
                                  "parents": parents, "gated_tree": planned["tree"], "observed_tree": observed,
-                                 "identity": identity, "at": self.clock()})
+                                 "identity": identity, "at": self.clock(), **record})
             if not identity:
                 self.alert("TREE_MISMATCH", family=family["id"], number=n, planned=planned["tree"],
                            observed=observed, merge=merged)

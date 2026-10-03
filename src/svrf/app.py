@@ -15,6 +15,7 @@ from .gate import CommandGate, MemoryGuard
 from .git import RealGit
 from .github import RealGitHub
 from .globs import PathSet
+from .tree_provider import TreeCommand
 
 
 def ensure_clone(config: Config) -> None:
@@ -56,6 +57,14 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
         extra["clock"] = clock
     if sleep is not None:
         extra["sleep"] = sleep
+    train_options = {"jobs": config.train.jobs, "family_size": config.train.family_size,
+                     "memory": memory, "rate_floor": config.train.rate_floor,
+                     "max_rounds": config.train.max_rounds, "comment": config.train.comment,
+                     "pr_comments": config.ui.pr_comments, "status_checks": config.ui.status_checks,
+                     "dashboard_url": config.ui.dashboard_url}
+    if config.merge.tree_command:
+        train_options["tree_provider"] = TreeCommand(config.merge.tree_command, config.clone,
+                                                     timeout=config.merge.tree_timeout_seconds)
     if config.demand_driver:
         try:
             module, factory = config.demand_driver.split(":", 1)
@@ -76,9 +85,5 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
                   # but a command supplies the same class of refusal.
                   reland=config.history.reland, kind=kind,
                   history_verdict=lambda b, h: history.verdict(git, b, h, kind, prefixes),
-                  train_options={"jobs": config.train.jobs, "family_size": config.train.family_size,
-                                 "memory": memory, "rate_floor": config.train.rate_floor,
-                                 "max_rounds": config.train.max_rounds, "comment": config.train.comment,
-                                 "pr_comments": config.ui.pr_comments, "status_checks": config.ui.status_checks,
-                                 "dashboard_url": config.ui.dashboard_url},
+                  train_options=train_options,
                   **extra)

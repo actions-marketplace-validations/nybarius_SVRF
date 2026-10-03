@@ -46,3 +46,7 @@ command = ""                # optional extra check; exit 0 admits, other codes h
 pr_comments = true          # one living comment per pull request (see docs/PR_SURFACE.md)
 status_checks = true        # a "svrf" commit status on each candidate head
 dashboard_url = ""          # optional: linked from the status as target_url
+
+[merge]
+tree_command = ""           # optional alternative merge engine, cross-checked against git (docs/TREE_PROVIDER.md)
+tree_timeout_seconds = 120  # per merge step; a timeout keeps git's tree

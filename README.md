@@ -193,6 +193,7 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
 | One train per repository: a file lock; a second owner exits 3 without reading anything | `owner_lock` | |
 | Every git call names its clone (`git -C`) and every `gh` call names its repository | `gh_argv`, a test over the source | |
 | Branches are updated by refspec push, never forced, never checked out | `RealGit` | |
+| A configured tree provider's tree is used only when it is git's own merge tree for that step; anything else keeps git's tree | `Train.merge_step` | |
 
 The theorems are about a model of the merge step, not about git. The code never relies
 on the model being right: it reads every landed tree and compares it with the gated one,
@@ -249,6 +250,8 @@ Unknown keys are refused.
 | `ui.pr_comments` | `true` | one living comment per pull request (see [docs/PR_SURFACE.md](docs/PR_SURFACE.md)) |
 | `ui.status_checks` | `true` | a `svrf` commit status on each candidate head |
 | `ui.dashboard_url` | `""` | optional: linked from the status as `target_url` |
+| `merge.tree_command` | `""` | optional alternative merge engine for the family merges, cross-checked against git's own merge tree on every step ([docs/TREE_PROVIDER.md](docs/TREE_PROVIDER.md)) |
+| `merge.tree_timeout_seconds` | `120` | per merge step; a timeout keeps git's tree |
 
 Gate commands see `SVRF_BASE`, `SVRF_COMMIT`, `SVRF_LABEL` and `SVRF_CHANGED_FILES` (a
 file listing the changed paths), so a gate can build only what changed.

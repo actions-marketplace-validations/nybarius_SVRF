@@ -180,9 +180,11 @@ def admission(row: dict, held: dict | None, watch_digest: str | None = None, car
 MERGE_CONFLICT = "merge:CONFLICT:"
 STALE_LINES = ("github:NOT_MERGEABLE",)
 # `history:` is the built-in tests-first check's own prefix; `reland:` is the one an
-# external admission.command uses to report the same order-only refusal (see
-# admission.py's PASSTHROUGH_PREFIXES). Both name the identical class of refusal.
-RELAND_LINE = re.compile(r"^(?:history|reland):REFUSED:(UNORDERED|MIXED)$")
+# external admission.command uses to report a qualified order-only refusal.
+# MERGE_LOSS requires that external qualification: the command must receive
+# preservation of the final tree before requesting its ordered reconstruction.
+RELAND_LINE = re.compile(
+    r"^(?:(?:history|reland):REFUSED:(UNORDERED|MIXED)|reland:REFUSED:(MERGE_LOSS))$")
 
 
 def repair_class(lines: list[str], is_union: Callable[[str], bool]) -> str | None:
@@ -200,15 +202,17 @@ def repair_class(lines: list[str], is_union: Callable[[str], bool]) -> str | Non
 
 
 def reland_class(lines: list[str]) -> str | None:
-    """UNORDERED or MIXED when every residual is a history-order refusal of one class:
-    the order of commits, not their content, which the train fixes by re-landing the same
-    final tree as an ordered history. Any other residual stays held for a person."""
+    """One received history-order class, including externally qualified merge repair.
+
+    The train re-lands the same final tree. Unqualified loss and mixed residual
+    classes retain their holds.
+    """
     if not lines:
         return None
     matches = [RELAND_LINE.match(line) for line in lines]
     if not all(matches):
         return None
-    classes = {m.group(1) for m in matches}
+    classes = {m.group(1) or m.group(2) for m in matches}
     return classes.pop() if len(classes) == 1 else None
 
 

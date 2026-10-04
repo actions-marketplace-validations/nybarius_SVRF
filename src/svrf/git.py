@@ -18,7 +18,7 @@ from typing import Callable
 
 from .errors import ReadFailed
 from .redact import redact
-from .rules import union_lines
+from .rules import union_attributes
 
 
 @dataclass
@@ -62,6 +62,10 @@ class RealGit:
     def _run(self, *args, input: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True, input=input,
                               env=env or self.env)
+
+    def _raw(self, *args, input: bytes | None = None) -> subprocess.CompletedProcess:
+        """`_run` with bytes in and out: file contents and paths exactly as git holds them."""
+        return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, input=input, env=self.env)
 
     def _out(self, *args, input: str | None = None, env: dict | None = None) -> str:
         done = self._run(*args, input=input, env=env)
@@ -152,9 +156,11 @@ class RealGit:
 
     def union_step(self, acc: str, head: str, message: str, union: Callable[[str], bool] | None = None) -> Step:
         """Merge `acc` (the base branch, or the fold so far) into the pull request `head`:
-        git's merge with the pull request as ours and the base as theirs, configured
-        union-merge paths resolved by `union_lines`, committed with parents (head, acc)
-        exactly as `git merge <base>` on the branch would."""
+        git's merge with the pull request as ours and the base as theirs, committed with
+        parents (head, acc) exactly as `git merge <base>` on the branch would. When every
+        path that merge leaves conflicted is a configured union-merge path, the merge is
+        made again by git with `merge=union` declared for those paths, so each is git's own
+        union merge, byte for byte what `.gitattributes` declaring it would give."""
         union = union or self.union
         try:
             if self.is_ancestor(acc, head):
@@ -163,33 +169,60 @@ class RealGit:
                 return Step("CLEAN", commit=acc, tree=self.tree(acc))
             # Same attribute-source fix as `merge_preview`: read .gitattributes from `acc`
             # (the base/theirs side), never from this clone's checkout.
-            done = self._run("-c", f"attr.tree={acc}", "merge-tree", "--write-tree", head, acc)
-            if done.returncode not in (0, 1):
-                return Step("FAILED", reason=f"MERGE_TREE_FAILED:{done.returncode}")
-            lines = done.stdout.split("\n")
-            tree = lines[0].strip()
-            if done.returncode == 1:
-                stages: dict[str, dict[int, tuple[str, str]]] = {}
-                for line in lines[1:]:
-                    if not line.strip():
-                        break
-                    meta, _, path = line.partition("\t")
-                    mode, sha, stage = meta.split()
-                    stages.setdefault(path, {})[int(stage)] = (mode, sha)
+            code, tree, stages = self._merge_tree(acc, head, acc)
+            if code == 1:
                 other = sorted(p for p in stages if not union(p))
                 if other:
                     return Step("CONFLICT", conflicts=other)
-                for path, by_stage in stages.items():
+                for path, by_stage in sorted(stages.items()):
                     if 2 not in by_stage or 3 not in by_stage:
                         return Step("CONFLICT", conflicts=[path])
-                    ours = self._out("cat-file", "blob", by_stage[2][1])
-                    theirs = self._out("cat-file", "blob", by_stage[3][1])
-                    blob = self._out("hash-object", "-w", "--stdin", input=union_lines(theirs=theirs, ours=ours))
-                    tree = self._overlay_tree(tree, {path: (by_stage[2][0], blob)})
+                code, tree, stages = self._merge_tree(self._union_attribute_tree(acc, sorted(stages)), head, acc)
+                if code == 1:
+                    return Step("CONFLICT", conflicts=sorted(stages))
             commit = self._out("commit-tree", tree, "-p", head, "-p", acc, "-m", message)
             return Step("CLEAN", commit=commit, tree=tree)
         except ReadFailed as failure:
             return Step("FAILED", reason=failure.reason)
+
+    def _merge_tree(self, attributes: str, ours: str, theirs: str) -> tuple[int, str, dict[str, dict[int, str]]]:
+        """git's merge of `ours` and `theirs` with .gitattributes read from `attributes`:
+        (0 clean or 1 conflicted, the tree, each conflicted path's stages)."""
+        done = self._raw("-c", f"attr.tree={attributes}", "merge-tree", "--write-tree", "-z", "--no-messages",
+                         ours, theirs)
+        if done.returncode not in (0, 1):
+            raise ReadFailed(f"MERGE_TREE_FAILED:{done.returncode}")
+        fields = done.stdout.split(b"\0")
+        tree = fields[0].decode().strip()
+        stages: dict[str, dict[int, str]] = {}
+        if done.returncode == 1:
+            for field in fields[1:]:
+                if not field:
+                    break
+                meta, _, path = field.partition(b"\t")
+                _mode, sha, stage = meta.decode().split()
+                stages.setdefault(path.decode("utf-8", "surrogateescape"), {})[int(stage)] = sha
+        return done.returncode, tree, stages
+
+    def _union_attribute_tree(self, commit: str, paths: list[str]) -> str:
+        """`commit`'s tree with `merge=union` declared for `paths`, each in the
+        `.gitattributes` of its own directory after whatever that file already declares:
+        an attribute source for git's merge, never committed."""
+        by_dir: dict[str, list[str]] = {}
+        for path in paths:
+            folder, _, name = path.rpartition("/")
+            by_dir.setdefault(folder, []).append(name)
+        sets: dict[str, tuple[str, str] | None] = {}
+        for folder, names in by_dir.items():
+            attributes = f"{folder}/.gitattributes" if folder else ".gitattributes"
+            read = self._raw("cat-file", "blob", f"{commit}:{attributes}")
+            text = read.stdout.decode("utf-8", "surrogateescape") if read.returncode == 0 else ""
+            body = union_attributes(text, names).encode("utf-8", "surrogateescape")
+            written = self._raw("hash-object", "-w", "--stdin", input=body)
+            if written.returncode != 0:
+                raise ReadFailed(f"GIT_FAILED:hash-object:{written.returncode}")
+            sets[attributes] = ("100644", written.stdout.decode().strip())
+        return self._overlay_tree(self.tree(commit), sets)
 
     repair_step = union_step
 

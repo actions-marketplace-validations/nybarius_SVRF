@@ -120,7 +120,7 @@ class Daemon:
             return
         state["last_tick"] = {k: summary[k] for k in (
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
-            "admitted", "held", "merged", "skipped", "retry_later", "reasons",
+            "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -319,6 +319,12 @@ class Daemon:
         summary["merged"].extend(m["number"] for m in receipt["merges"] if m.get("identity"))
         summary["api_calls"] = receipt.get("api_calls")
         summary["gates"] = summary.get("gates", 0) + len([g for g in receipt["gates"] if "reused" not in g])
+        if "tree_provider" in receipt:
+            total = summary.setdefault("tree_provider", {"consulted": 0, "provider": 0, "git": 0, "reasons": {}})
+            for key in ("consulted", "provider", "git"):
+                total[key] += receipt["tree_provider"][key]
+            for reason, count in receipt["tree_provider"]["reasons"].items():
+                total["reasons"][reason] = total["reasons"].get(reason, 0) + count
         repaired: set[int] = set()
         for hold in receipt["holds"]:
             n = int(hold["number"])

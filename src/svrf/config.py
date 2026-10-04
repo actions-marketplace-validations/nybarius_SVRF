@@ -50,6 +50,12 @@ class UiConfig:
 
 
 @dataclass
+class MergeConfig:
+    tree_command: str = ""        # "": git alone builds every merge step
+    tree_timeout_seconds: float = 120
+
+
+@dataclass
 class HistoryConfig:
     order: str = "off"            # "off" or "tests-first"
     reland: bool = True
@@ -78,6 +84,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
 
     # ---- derived paths
     @property
@@ -101,7 +108,8 @@ class Config:
         return PathSet(self.union_merge)
 
 
-_SECTIONS = {"gate": GateConfig, "train": TrainConfig, "history": HistoryConfig, "ui": UiConfig}
+_SECTIONS = {"gate": GateConfig, "train": TrainConfig, "history": HistoryConfig, "ui": UiConfig,
+             "merge": MergeConfig}
 _TOP = {"repo", "base", "clone", "state_dir", "remote", "git_name", "git_email", "hold_label", "admission_command", "demand_driver"}
 
 
@@ -157,6 +165,11 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
         raise ConfigError("history.order must be \"off\" or \"tests-first\"")
     if config.train.family_size < 1 or config.train.jobs < 1:
         raise ConfigError("train.family_size and train.jobs must be at least 1")
+    timeout = config.merge.tree_timeout_seconds
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ConfigError("[merge] tree_timeout_seconds must be a positive number of seconds")
+    if not isinstance(config.merge.tree_command, str):
+        raise ConfigError("[merge] tree_command must be a string")
     if not config.gate.commands:
         raise ConfigError("gate.commands must name at least one command")
     return config

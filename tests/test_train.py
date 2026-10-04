@@ -30,11 +30,6 @@ def train(repo, gh, gate, tmp, clock=None, **kw):
 
 
 class PureReads(unittest.TestCase):
-    def test_union_lines_keep_base_order_then_the_additions_once(self):
-        base = "a\nb\nm\n"
-        head = "a\nb\nl\n"
-        self.assertEqual(rules.union_lines(theirs=base, ours=head), "a\nb\nm\nl\n")
-
     def test_a_rate_limit_is_a_read_failure_never_a_conflict(self):
         with self.assertRaises(RateLimited) as caught:
             classify_gh_failure(1, "GraphQL: API rate limit already exceeded for user ID 7.")

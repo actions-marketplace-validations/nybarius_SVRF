@@ -3,11 +3,13 @@ import BraidedTrain.Braid
 /-!
 # BraidedTrain.Union — the line-level union merge as a model step
 
-`svrf.rules.union_lines(theirs, ours)` keeps the base side's lines in order and appends each
-line of the pull request's side that is not already there, once. `unionLines` is that
-function on lists of lines. `git.RealGit.union_step` applies it only on configured union
-paths, and only when every path git's merge reports as conflicted is a union path; any
-other conflicted path keeps the two heads apart. Finite lists, no Mathlib.
+`unionLines theirs ours` keeps the base side's lines in order and appends each line of the
+pull request's side that is not already there, once: the union of two line lists, as a
+model. `git.RealGit.union_step` applies a union only on configured union paths, and only
+when every path git's merge reports as conflicted is a union path; any other conflicted
+path keeps the two heads apart. The code's union is git's own (`merge=union`), declared
+for those paths through `svrf.rules.union_attributes`; see the modelling boundary below.
+Finite lists, no Mathlib.
 
 1. `count_unionLines`: the count of a line after a union is its count on the base side,
    plus one exactly when the base side lacks it and the pull request's side has it. Every
@@ -30,6 +32,12 @@ other conflicted path keeps the two heads apart. Finite lists, no Mathlib.
 Modelling boundary: git merges a non-union file edited on both sides hunk by hunk; this
 model treats such a path as a conflict (the coarser, path-level reading used by
 `apply_comm_of_disjoint`), and it treats every edit of a union path as a union of lines.
+git's union merge is also hunk by hunk: inside each conflicting hunk it keeps the pull
+request's lines and then the base side's, outside them it is git's ordinary merge, and it
+neither drops repeated lines nor restores lines one side deleted. `unionLines` is the
+line-set reading of that merge, not its exact byte order; the train never relies on that
+order, because it fixes the fold order once, replays it at landing, and compares the
+landed tree with the gated tree byte for byte.
 -/
 
 set_option linter.unusedSimpArgs false
@@ -43,7 +51,7 @@ variable {Line : Type} [DecidableEq Line]
 def addLine (acc : List Line) (l : Line) : List Line :=
   if l ∈ acc then acc else acc ++ [l]
 
-/-- `union_lines(theirs, ours)`: the base side's lines, then each new line of ours, once. -/
+/-- The line-set union: the base side's lines, then each new line of ours, once. -/
 def unionLines (theirs ours : List Line) : List Line :=
   ours.foldl addLine theirs
 

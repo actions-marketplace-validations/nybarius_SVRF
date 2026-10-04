@@ -241,7 +241,7 @@ Unknown keys are refused.
 | `train.interval_seconds` | `300` | sleep between rounds in `watch` |
 | `labels.hold` | `"train:hold"` | label that keeps a pull request out |
 | `repair.enabled` | `true` | push mechanical fixes (union merges, stale base) to pull-request branches |
-| `repair.union_merge` | `[]` | globs of files merged by line union instead of conflicting |
+| `repair.union_merge` | `[]` | globs of files merged by git's union merge (`merge=union`) instead of conflicting |
 | `history.order` | `"off"` | `"tests-first"` refuses code committed before its tests |
 | `history.reland` | `true` | re-land refused histories in order instead of holding them |
 | `history.tests`, `history.docs` | common globs | how paths are classified for the history check |

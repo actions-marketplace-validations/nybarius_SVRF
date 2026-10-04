@@ -16,6 +16,17 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
   row carries `tree_source`; the receipt and the round summary carry the totals. Unset,
   nothing changes. See `docs/TREE_PROVIDER.md`.
 
+### Fixed
+
+- `[repair] union_merge` paths are now merged by git's own union merge, byte for byte what
+  `git merge` gives with `merge=union` declared for them in `.gitattributes`: inside each
+  conflicting hunk the pull request's lines and then the base branch's, in place, with
+  repeated lines kept, a line one side deleted left deleted, and line endings and bytes
+  untouched. Previously the whole base-side file came first, the pull request's new lines
+  were appended at the end, repeated lines were collapsed and CRLF line endings were lost,
+  so a union-merged step did not match a tree provider or a `git merge` computing git's
+  union.
+
 ## [0.2.0] - 2026-09-25
 
 ### Changed

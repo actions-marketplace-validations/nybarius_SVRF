@@ -34,7 +34,7 @@ RULES: dict[str, dict[str, str]] = {
     "interleaved-owners": {"lean": "interleaved_landing", "check": "choose_families"},
     "repair-mechanical": {"lean": "retry_iff", "check": "repair_class"},
     "ordered-reland": {"lean": "reland_tree", "check": "reland_class"},
-    "union-merge": {"lean": "change_comm", "check": "union_lines"},
+    "union-merge": {"lean": "change_comm", "check": "union_attributes"},
     "speculative-stacking": {"lean": "stack_lands_gated", "check": "Train.round"},
     "speculation-void": {"lean": "stackStatus_void_iff", "check": "Train.round"},
     "bisect-holds-exactly-red": {"lean": "settle_outcome", "check": "Train.settle_red"},
@@ -49,17 +49,21 @@ RULES: dict[str, dict[str, str]] = {
 # --------------------------------------------------------------------------- merging
 
 
-def union_lines(*, theirs: str, ours: str) -> str:
-    """A union-merged file: the base branch's lines in order, then the lines the pull
-    request adds, each once. Suited to files whose lines are independent entries: import
-    indexes, requirement lists, changelog bullets."""
-    out = theirs.splitlines()
-    seen = set(out)
-    for line in ours.splitlines():
-        if line not in seen:
-            out.append(line)
-            seen.add(line)
-    return "\n".join(out) + "\n"
+def union_attributes(text: str, names) -> str:
+    """A directory's `.gitattributes` body (`text`, possibly empty) with git's union merge
+    (`merge=union`) declared for each file name in `names`, after everything `text` already
+    declares, so for those files it is the line git reads last. Each name is anchored to the
+    directory and its pattern characters escaped; a name with whitespace, a quote or a
+    control character is written as a quoted pattern."""
+    out = text if not text or text.endswith("\n") else text + "\n"
+    for name in sorted(set(names)):
+        pattern = "/" + re.sub(r"([\\*?\[])", r"\\\1", name)
+        if any(c.isspace() or c == '"' or ord(c) < 32 or ord(c) == 127 for c in pattern):
+            quoted = pattern.replace("\\", "\\\\").replace('"', '\\"')
+            quoted = re.sub(r"[\x00-\x1f\x7f]", lambda m: "\\%03o" % ord(m.group()), quoted)
+            pattern = f'"{quoted}"'
+        out += f"{pattern} merge=union\n"
+    return out
 
 
 def chunk(items: list, size: int) -> list[list]:

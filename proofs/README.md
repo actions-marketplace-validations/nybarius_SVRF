@@ -64,7 +64,7 @@ states it and the function or method that enforces it in the running train.
 | `interleaved-owners` | `interleaved_landing` | `choose_families` |
 | `repair-mechanical` | `retry_iff` | `repair_class` |
 | `ordered-reland` | `reland_tree` | `reland_class` |
-| `union-merge` | `change_comm` | `union_lines` |
+| `union-merge` | `change_comm` | `union_attributes` |
 | `speculative-stacking` | `stack_lands_gated` | `Train.round` |
 | `speculation-void` | `stackStatus_void_iff` | `Train.round` |
 | `bisect-holds-exactly-red` | `settle_outcome` | `Train.settle_red` |
@@ -88,7 +88,7 @@ or rename a rule, update the table above and the code together; the test fails o
 | `BraidedTrain/Braid.lean` | The ungated-window invariant (`AllGated`, `mains`); retry as a function of a read key; commutation of disjoint writes (`strands_comm`). |
 | `BraidedTrain/Interleaving.lean` | Two owners landing path-disjoint families interleaved still land one tree (`interleaved_landing`); when a gate's own read paths miss the other owner's writes, no joint gate is needed (`two_owners_end_gated`). |
 | `BraidedTrain/Reland.lean` | Re-landing a history as tests-then-code-then-docs commits lands the identical tree (`reland_tree`), so any tree-reading gate's verdict is unchanged (`reland_gate`). |
-| `BraidedTrain/Union.lean` | The line-level union merge (`unionLines`, the model of `union_lines`): exact associativity (`unionLines_assoc`), commutation up to line order (`unionLines_comm`, sharp by `union_order_visible`), and at the path level `change_comm` / `family_perm` under `UnionOnlyOverlap`, the union repair's hypothesis. |
+| `BraidedTrain/Union.lean` | The line-level union merge (`unionLines`, the line-set model of git's `merge=union`, which `union_attributes` declares for the union paths): exact associativity (`unionLines_assoc`), commutation up to line order (`unionLines_comm`, sharp by `union_order_visible`), and at the path level `change_comm` / `family_perm` under `UnionOnlyOverlap`, the union repair's hypothesis. |
 | `BraidedTrain/Stacking.lean` | Speculative stacking: families gated on the fold of every family before them land gated trees at every family boundary (`stack_lands_gated`); a stacked verdict does not carry past a red family (`stack_fold_through`, `stacked_verdict_does_not_carry`); the round's bookkeeping voids exactly the families above the first red one (`stackStatus_void_iff`, `stackStatus_landed_iff`, `stackStatus_bisected_iff`). |
 | `BraidedTrain/Bisection.lean` | Bisection of a red family (`settle`, the model of `Train.settle_red`) terminates (well-founded on family length), holds exactly the bad pull requests and lands the rest under a monotone gate (`settle_outcome`), and costs at most `2·r·⌈log₂ n⌉ + 1` gates including the family's own (`settle_gates_le`, `bisection_gates_le`). |
 | `BraidedTrain/Families.lean` | The Bron–Kerbosch recursion of `families`, with arbitrary pivot and iteration order: every family it reports is a maximal compatible set (`bk_maximal`), so the family `choose_families` keeps holds no conflicting pair and every pull request left out conflicts with a kept one (`chosen_family_maximal`). With a pivot drawn from the candidates or excluded nodes (the code's rule, `codePivot_mem`) and an order visiting every node, it reports every maximal compatible set (`bk_complete`), so the first family of the size-sorted list is a maximum compatible set (`chosen_family_maximum`). |

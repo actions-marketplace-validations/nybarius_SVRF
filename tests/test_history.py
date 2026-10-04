@@ -175,7 +175,7 @@ class RepairPlumbing(Repo):
         self.assertEqual(pushed, step.commit)
         self.assertEqual(g.parents(step.commit), [head, main])
         text = git(self.work, "cat-file", "-p", f"{step.commit}:requirements.txt")
-        self.assertEqual(text.splitlines(), ["a", "main", "lane"])
+        self.assertEqual(text.splitlines(), ["a", "lane", "main"])
         rows = history.dispositions(g, main, step.commit, KIND)
         self.assertEqual([r["disposition"] for r in rows], ["TESTS", "CODE", "MERGE"])
 

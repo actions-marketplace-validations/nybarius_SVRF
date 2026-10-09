@@ -18,7 +18,8 @@ infra_patterns = []         # extra regexes meaning "the gate could not run"
 failing_pattern = "error|FAIL|Traceback"
 
 [train]
-family_size = 8             # pull requests folded into one gated tree
+family_size = 8            # or "adaptive": chosen each round from the train's own receipts
+# family_cap = 8          # the most an adaptive family may hold             # pull requests folded into one gated tree
 jobs = 2                    # families gated in parallel (one worktree slot each)
 max_rounds = 3              # replanning rounds within one tick
 rate_floor = 200            # pause while GitHub's remaining budget is below this

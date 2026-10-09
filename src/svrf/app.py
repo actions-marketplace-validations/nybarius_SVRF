@@ -49,7 +49,8 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
     # slot directory.
     admission = Admission(git, order=config.history.order, kind=kind, refactor_prefixes=prefixes,
                           command=config.admission_command, pool=Path(config.worktrees) / "admission",
-                          slots=config.train.jobs, timeout=config.admission_timeout_minutes * 60)
+                          slots=config.admission_slots or config.train.jobs,
+                          timeout=config.admission_timeout_minutes * 60)
     memory = MemoryGuard(need_gb=config.gate.memory_gb, reserve_gb=config.gate.memory_reserve_gb) \
         if config.gate.memory_gb else None
     extra = {}
@@ -58,6 +59,7 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
     if sleep is not None:
         extra["sleep"] = sleep
     train_options = {"jobs": config.train.jobs, "family_size": config.train.family_size,
+                     "family_cap": config.train.family_cap,
                      "memory": memory, "rate_floor": config.train.rate_floor,
                      "max_rounds": config.train.max_rounds, "comment": config.train.comment,
                      "pr_comments": config.ui.pr_comments, "status_checks": config.ui.status_checks,

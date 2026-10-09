@@ -67,7 +67,8 @@ class Daemon:
                  rate_floor: int = 200, lock_path: Path | None = None, hold_label: str = "train:hold",
                  is_union: Callable[[str], bool] = lambda p: False, repair: bool = True, reland: bool = True,
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
-                 admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None):
+                 admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None,
+                 admission_jobs: int | None = None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -89,6 +90,8 @@ class Daemon:
         # memory guard the gate uses (both can run the same heavy suite), the way
         # `Train.round` already gates independent families concurrently.
         self.jobs, self.memory = max(1, jobs), memory
+        # admission reads overlap up to their own count; None borrows the gate's jobs as before
+        self.admission_jobs = max(1, admission_jobs) if admission_jobs else self.jobs
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
 
@@ -258,7 +261,7 @@ class Daemon:
             inputs["admission_base"] = base
             if self.admission_watch:
                 inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
-        executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="admission")
+        executor = ThreadPoolExecutor(max_workers=self.admission_jobs, thread_name_prefix="admission")
         try:
             pending = {executor.submit(self._read_admission, row, base): row for row in candidates}
             while pending:

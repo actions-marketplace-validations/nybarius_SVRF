@@ -182,6 +182,14 @@ class Rounds(unittest.TestCase):
         self.assertGreaterEqual(admission.peak, 2)
         self.assertLessEqual(admission.peak, 4)
 
+    def test_admission_jobs_overlap_reads_independently_of_gate_jobs(self):
+        repo = DaemonRepo([141, 142, 143, 144])
+        gh = DaemonGitHub(repo)
+        admission = Admission(delay=0.2)
+        out = daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=1, admission_jobs=4).tick()
+        self.assertEqual(out["admitted"], [141, 142, 143, 144])
+        self.assertGreaterEqual(admission.peak, 2)
+
     def test_admission_jobs_of_one_reads_serially(self):
         repo = DaemonRepo([18, 19])
         gh = DaemonGitHub(repo)

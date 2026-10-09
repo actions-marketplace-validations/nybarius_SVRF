@@ -104,3 +104,19 @@ class Config(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrainUsesTheChosenSize(unittest.TestCase):
+    def test_adaptive_train_records_its_choice_and_cuts_families_by_it(self):
+        from fakes import FakeGate, FakeGitHub, FakeRepo
+        from test_train import train
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            for i in range(30):
+                _receipt(folder, f"r{i}", 1, landed=(i % 2 == 0))   # p = 1/2: gate one at a time
+            repo = FakeRepo([1, 2, 3])
+            gh, gate = FakeGitHub(repo), FakeGate(repo)
+            receipt = train(repo, gh, gate, tmp, family_size="adaptive", family_cap=8).run([1, 2, 3])
+            self.assertEqual(receipt["batching"][0]["family_size"], 1)
+            self.assertEqual(gh.merged, [1, 2, 3])
+            self.assertTrue(all(len(f["prs"]) == 1 for f in receipt["families"]))

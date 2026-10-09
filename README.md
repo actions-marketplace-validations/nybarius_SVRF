@@ -157,7 +157,7 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    on another branch. A stacked pull request waits for its parent and is retargeted to
    the base once the parent merges. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
-   admission command pass. Up to `train.jobs` heads are read at once, each in its own
+   admission command pass. Up to `admission.slots` heads are read at once, each in its own
    worktree. Completed heads reach the train while other admissions continue; all
    results available together stay in one batch. Admission and gating share the memory
    limit, so a gate still waits when the host has no capacity. Uneven completion can
@@ -165,7 +165,8 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
 3. **Families.** Read which pairs of heads conflict (git's own merge of each pair). Keep
    the largest set that pairwise does not conflict; conflicts only on union-merge files
    (changelogs, requirement lists, import indexes) do not count. Fold the kept heads onto
-   the base and cut them into families of `family_size`. Family k is gated on top of
+   the base and cut them into families of `family_size` (a fixed count, or the adaptive
+   size below). Family k is gated on top of
    families 1..k, so families gate in parallel and every gated tree is a tree the base
    will actually hold.
 4. **Gate.** Run your commands once per family in a dedicated worktree slot.
@@ -177,6 +178,28 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    again. A red single pull request is held with its failing lines.
 7. **Memory.** A held pull request is not read again until its head changes or the base
    changes a file its hold depended on.
+
+## Adaptive family size
+
+With `family_size = "adaptive"` the train chooses each round's family size from its own
+retained receipts. A family of `k` pull requests costs one gate run when every member is
+green. When any member is red it is halved and each half is gated again. With a per-PR red
+probability `p`, the expected gate runs for a family of `k` are
+
+    E(1) = 1,    E(k) = 1 + (1 - (1-p)^k) * (E(floor(k/2)) + E(ceil(k/2)))
+
+The size chosen minimises `E(k)/k` for `k` in `1..family_cap`. `p` is the maximum-likelihood
+estimate from each round's first family, counted once per exact set of (pull request, head)
+pairs: a held red head re-gated in later rounds is the same verdict, not a new red arrival.
+With no receipts yet, the cap is used. Each receipt records the choice and its evidence under
+`batching`.
+
+On one busy deployment, counting every re-gate of the same red heads gave `p = 0.36` and
+`k = 1`. Counting each (pull request, head) once gave `p = 0.17` and `k = 6`, which is 0.64
+gate runs per pull request. The first round at `k = 6` landed 20 pull requests.
+
+A check that can refuse a head cheaply belongs in `admission.command`. A refusal found only
+at the gate costs a gate run, plus every speculative family stacked behind it in that round.
 
 ## How it stays safe
 
@@ -233,8 +256,9 @@ Unknown keys are refused.
 | `gate.infra_patterns` | `[]` | extra regexes meaning the gate could not run |
 | `gate.failing_pattern` | `error\|FAIL\|Traceback` | which output lines to report for a red gate |
 | `gate.env` | `{}` | extra environment for gate commands |
-| `train.family_size` | `8` | pull requests per gated family |
-| `train.jobs` | `2` | families gated in parallel, and also how many admission reads (candidates' `admission.command`) run at once, each in its own worktree and admitted by the same `gate.memory_gb`/`memory_reserve_gb` guard as a gate |
+| `train.family_size` | `8` | pull requests per gated family, or `"adaptive"`: chosen each round from the train's own receipts (see [Adaptive family size](#adaptive-family-size)) |
+| `train.family_cap` | `8` | the largest family an adaptive size may choose |
+| `train.jobs` | `2` | families gated in parallel, each in its own worktree slot |
 | `train.max_rounds` | `3` | replanning rounds per tick |
 | `train.rate_floor` | `200` | pause while GitHub's remaining budget is below this |
 | `train.comment` | `true` | comment on merged pull requests |
@@ -247,6 +271,7 @@ Unknown keys are refused.
 | `history.tests`, `history.docs` | common globs | how paths are classified for the history check |
 | `admission.command` | `""` | extra admission check; exit 0 admits, 126/127 means "could not run" |
 | `admission.watch` | `[]` | paths every hold depends on (requirements, toolchain pins); a base change there rereads every hold |
+| `admission.slots` | `train.jobs` | admission reads (candidates' `admission.command`) run at once, each in its own worktree and admitted by the same `gate.memory_gb`/`memory_reserve_gb` guard as a gate |
 | `ui.pr_comments` | `true` | one living comment per pull request (see [docs/PR_SURFACE.md](docs/PR_SURFACE.md)) |
 | `ui.status_checks` | `true` | a `svrf` commit status on each candidate head |
 | `ui.dashboard_url` | `""` | optional: linked from the status as `target_url` |

@@ -9,6 +9,12 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
 
 ### Added
 
+- `train.family_size = "adaptive"` with `train.family_cap`: each round chooses the family
+  size that minimises expected gate runs per pull request under halving bisection, from the
+  red probability estimated by maximum likelihood over the train's own receipts. The choice
+  and its evidence are recorded in each receipt under `batching`. A fixed count works as before.
+- `[admission] slots`: how many admission reads run at once, independent of the gate's
+  `train.jobs`. Default `train.jobs`. The daemon's admission pool uses it too.
 - `[merge] tree_command`: an optional tree provider for the family merges. For every
   merge step the train builds, the command proposes a tree; git's own merge tree is always
   computed and the proposed tree is used only when identical. A different tree, a failure,
@@ -18,6 +24,12 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
 
 ### Fixed
 
+- The adaptive red-rate estimate counts each exact (pull request, head) family once. Before
+  this, a held red head re-gated across rounds counted as a new red arrival every time,
+  which inflated `p` and pinned the adaptive size at 1.
+- A reland overlays its changed paths with one `update-index -z --index-info` call per tree.
+  It used to run one `update-index` per path, which took over an hour on a reland of
+  thousands of paths.
 - `[repair] union_merge` paths are now merged by git's own union merge, byte for byte what
   `git merge` gives with `merge=union` declared for them in `.gitattributes`: inside each
   conflicting hunk the pull request's lines and then the base branch's, in place, with

@@ -145,6 +145,33 @@ class Relands(Repo):
         self.assertEqual(result.tree, g.tree(head))
 
 
+    def test_a_wide_reland_overlays_every_path_with_one_index_update(self):
+        """A reland of a wide head (hundreds of paths, special characters included) runs one
+        `update-index` per overlaid tree, not one per path (each per-path call rewrites the whole
+        index, which takes hours on a large repository)."""
+        from unittest import mock
+        git(self.work, "checkout", "-q", "-b", "wide", self.base)
+        for i in range(120):
+            self.write(f"tests/test_w{i}.py", f"def test(): assert {i} >= 0\n")
+            self.write(f"src/w {i} \u00e9.py", f"value = {i}\n")
+        (self.work / "src" / "app.py").unlink()
+        head = self.commit("feat: wide")
+        g = self.rg()
+        tree = g.tree(head)
+        calls = []
+        real_run = g._run
+
+        def counting(*args, **kw):
+            calls.append(args[0])
+            return real_run(*args, **kw)
+
+        with mock.patch.object(g, "_run", side_effect=counting):
+            result = g.reland(self.base, tree, "wide", KIND)
+        self.assertEqual(result.status, "CLEAN")
+        self.assertEqual(result.tree, tree)
+        self.assertLessEqual(calls.count("update-index"), 3)
+
+
 class RepairPlumbing(Repo):
     def setUp(self):
         super().setUp()

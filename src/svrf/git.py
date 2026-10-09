@@ -232,12 +232,16 @@ class RealGit:
         with tempfile.TemporaryDirectory() as tmp:
             env = {**self.env, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
             self._out("read-tree", base_tree, env=env)
-            for path, value in sets.items():
-                if value is None:
-                    self._run("update-index", "--force-remove", path, env=env)
-                else:
-                    mode, blob = value
-                    self._out("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}", env=env)
+            if sets:
+                # One `update-index` for every path: each per-path call rewrites the whole index,
+                # which on a large repository costs a second or more per path. `-z --index-info`
+                # takes NUL-terminated "mode SP object TAB path" records; mode 0 with the null
+                # object removes the path.
+                null = "0" * len(base_tree)
+                records = "".join(
+                    (f"0 {null}\t{path}\0" if value is None else f"{value[0]} {value[1]}\t{path}\0")
+                    for path, value in sets.items())
+                self._out("update-index", "-z", "--index-info", input=records, env=env)
             return self._out("write-tree", env=env)
 
     def _tree_map(self, tree: str) -> dict[str, tuple[str, str]]:

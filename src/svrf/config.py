@@ -34,7 +34,8 @@ class GateConfig:
 
 @dataclass
 class TrainConfig:
-    family_size: int = 8
+    family_size: int | str = 8        # a whole count, or "adaptive" (svrf.batching)
+    family_cap: int = 8               # the most an adaptive family may hold
     jobs: int = 2
     max_rounds: int = 3
     rate_floor: int = 200
@@ -78,6 +79,7 @@ class Config:
     repair: bool = True
     admission_command: str = ""
     admission_timeout_minutes: float = 10
+    admission_slots: int | None = None   # None: borrow train.jobs
     demand_driver: str = ""
     admission_watch: list[str] = field(default_factory=list)
     gate: GateConfig = field(default_factory=GateConfig)
@@ -135,8 +137,13 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     kwargs["union_merge"] = list(repair.get("union_merge") or [])
     kwargs["repair"] = bool(repair.get("enabled", True))
     admission = value.get("admission") or {}
-    if set(admission) - {"command", "watch", "timeout_minutes"}:
-        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes'})}")
+    if set(admission) - {"command", "watch", "timeout_minutes", "slots"}:
+        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes', 'slots'})}")
+    if "slots" in admission:
+        slots = admission["slots"]
+        if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
+            raise ConfigError("[admission] slots must be a whole number of at least 1")
+        kwargs["admission_slots"] = slots
     kwargs["admission_watch"] = list(admission.get("watch") or [])
     if "command" in admission:
         kwargs["admission_command"] = admission["command"]
@@ -163,8 +170,17 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     config.state_dir = Path(config.state_dir).expanduser()
     if config.history.order not in ("off", "tests-first"):
         raise ConfigError("history.order must be \"off\" or \"tests-first\"")
-    if config.train.family_size < 1 or config.train.jobs < 1:
+    size = config.train.family_size
+    if isinstance(size, str):
+        if size != "adaptive":
+            raise ConfigError('train.family_size must be a whole number or "adaptive"')
+    elif isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise ConfigError("train.family_size and train.jobs must be at least 1")
+    if config.train.jobs < 1:
+        raise ConfigError("train.family_size and train.jobs must be at least 1")
+    if isinstance(config.train.family_cap, bool) or not isinstance(config.train.family_cap, int) \
+            or config.train.family_cap < 1:
+        raise ConfigError("train.family_cap must be a whole number of at least 1")
     timeout = config.merge.tree_timeout_seconds
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ConfigError("[merge] tree_timeout_seconds must be a positive number of seconds")

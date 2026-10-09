@@ -180,7 +180,8 @@ class Daemon:
         summary = {"tick": "IDLE", "at": _stamp(self.clock), "admitted": [], "held": [], "held_unchanged": [],
                    "repaired": [], "would_repair": [], "retargeted": [], "would_retarget": [], "skipped": {},
                    "retry_later": [], "reasons": {}, "merged": [], "merged_elsewhere": [],
-                   "would_close_merged": [], "held_rows": [], "relanded": [], "would_reland": [], "out": [],
+                   "would_close_merged": [], "held_rows": [], "relanded": [], "would_reland": [], "restacked": [], "would_restack": [],
+                   "out": [],
                    "receipt": None, "receipts": [], "stopped": False, "dry_run": self.dry_run}
         state = self.load_state()
         try:
@@ -203,8 +204,11 @@ class Daemon:
             return summary
         by_number = {int(r["number"]): r for r in rows}
         self.round_rows = by_number
+        stacked_on = {r.get("baseRefName") for r in rows}
         for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"]):
             for n in [n for n in memory if int(n) not in by_number]:
+                if memory is state["relanded"] and memory[n].get("from_ref") in stacked_on:
+                    continue  # a pull request still stacked on the re-landed branch reads this record
                 del memory[n]
         heads = {r.get("headRefName") for r in rows}
         candidates: list[dict] = []
@@ -444,7 +448,12 @@ class Daemon:
         elif any(p.get("state") == "open" for p in parents):
             summary["skipped"][str(n)] = "WAITING_PARENT"
         elif parents:
-            self.hold(row, "PARENT_CLOSED_UNMERGED", state, summary, paths=[base])
+            relanded = next((state["relanded"][str(p["number"])] for p in parents
+                             if str(p.get("number")) in state["relanded"]), None)
+            if relanded and self.reland_enabled:
+                self.restack(row, relanded, state, summary)
+            else:
+                self.hold(row, "PARENT_CLOSED_UNMERGED", state, summary, paths=[base])
         else:
             state["bases"][str(n)] = {"head": head, "base": base, "reason": "NOT_AGAINST_BASE"}
             summary["skipped"][str(n)] = "NOT_AGAINST_BASE"
@@ -523,6 +532,70 @@ class Daemon:
             return
         state["held"].pop(str(n), None)
         summary["repaired"].append({"number": n, "class": cls, "head": head, "pushed": step.commit})
+
+    def restack(self, row: dict, parent: dict, state: dict, summary: dict) -> None:
+        """A stacked pull request whose parent this train re-landed: replay the child's own
+        commits (those after the parent head that was re-landed) onto the ordered branch,
+        push them to `<branch>-restacked` and open a pull request on the ordered branch that
+        supersedes the child. Restacked only onto an open ordered pull request, and only when
+        the rebuilt tree is exactly git's merge of the child's head and the ordered head;
+        otherwise held. The record it leaves lets the child's own children follow."""
+        n = int(row["number"])
+        head, ref, title = row.get("headRefOid"), row.get("headRefName"), row.get("title", "")
+        if self.dry_run:
+            summary["would_restack"].append(n)
+            return
+        try:
+            onto = self.gh.pull(int(parent["new_number"]))
+        except ReadFailed as failure:
+            self._retry(summary, n, f"RESTACK:{failure.reason}")
+            return
+        if onto.get("state") != "open":
+            self.hold(row, "PARENT_CLOSED_UNMERGED", state, summary, paths=[row.get("baseRefName")])
+            return
+        try:
+            expected = self.git.union_step(onto["head_sha"], head, f"Merge {parent['ref']} into {ref}")
+        except ReadFailed as failure:
+            self._retry(summary, n, f"RESTACK:{failure.reason}")
+            return
+        if expected.status == "CONFLICT":
+            self.hold(row, "RESTACK_CONFLICT", state, summary, paths=expected.conflicts)
+            return
+        if expected.status != "CLEAN":
+            self._retry(summary, n, f"RESTACK:{expected.reason}")
+            return
+        result = self.git.restack(parent["head"], head, onto["head_sha"])
+        if result.status == "FAILED":
+            self._retry(summary, n, f"RESTACK:{result.reason}")
+            return
+        if result.status == "CONFLICT":
+            self.hold(row, "RESTACK_CONFLICT", state, summary)
+            return
+        if result.tree != expected.tree:
+            self.hold(row, "RESTACK_TREE_MISMATCH", state, summary)
+            return
+        final = result.commits[-1] if result.commits else onto["head_sha"]
+        new_ref = f"{ref}-restacked"
+        try:
+            self.git.push_branch(final, new_ref)
+        except ReadFailed as failure:
+            self._retry(summary, n, f"RESTACK:{failure.reason}")
+            return
+        body = (f"Supersedes #{n}: its own commits replayed onto #{parent['new_number']} "
+                f"(`{parent['ref']}`, the ordered re-land of its parent), ending on exactly git's "
+                "merge of the two heads.\n\n" + _strip_trailers(row.get("body") or ""))
+        try:
+            new_number = self.gh.open_pr(new_ref, parent["ref"], title, body)
+            self.gh.comment(n, f"Superseded by #{new_number} (restacked onto #{parent['new_number']}).")
+            self.gh.close(n)
+        except ReadFailed as failure:
+            self._retry(summary, n, f"RESTACK:{failure.reason}")
+            return
+        state["held"].pop(str(n), None)
+        state["relanded"][str(n)] = {"head": head, "ref": new_ref, "new_number": new_number,
+                                     "at": summary["at"], "onto": parent["new_number"], "from_ref": ref}
+        summary["restacked"].append({"number": n, "new_number": new_number, "ref": new_ref,
+                                     "onto": parent["new_number"]})
 
     def reland(self, row: dict, cls: str, state: dict, summary: dict) -> None:
         """Rebuild the head's final tree (after the usual union merge of the base) as an
@@ -606,5 +679,6 @@ class Daemon:
             self._retry(summary, n, f"RELAND:{failure.reason}")
             return
         state["held"].pop(str(n), None)
-        state["relanded"][str(n)] = {"head": head, "ref": ordered_ref, "new_number": new_number, "at": summary["at"]}
+        state["relanded"][str(n)] = {"head": head, "ref": ordered_ref, "new_number": new_number, "at": summary["at"],
+                                     "from_ref": ref}
         summary["relanded"].append({"number": n, "new_number": new_number, "ref": ordered_ref})

@@ -62,14 +62,18 @@ _receipt_serial = itertools.count()
 
 
 class Train:
-    def __init__(self, git, github, gate, *, receipts: Path, jobs: int = 1, family_size: int = 8,
+    def __init__(self, git, github, gate, *, receipts: Path, jobs: int = 1, family_size: int | str = 8,
+                 family_cap: int = 8,
                  memory=None, clock=time.time, sleep=time.sleep, rate_floor: int = 200, rate_retries: int = 6,
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
                  hold_label: str = "train:hold", tree_provider=None):
         self.git, self.gh, self.gate = git, github, gate
-        self.jobs, self.family_size, self.memory = max(1, jobs), max(1, family_size), memory
+        self.jobs, self.memory = max(1, jobs), memory
+        self.family_cap = max(1, family_cap)
+        self.family_size = "adaptive" if family_size == "adaptive" else max(1, family_size)
+        self.receipts_dir = Path(receipts).expanduser()
         self.clock, self.sleep = clock, sleep
         self.rate_floor, self.rate_retries = rate_floor, rate_retries
         self.poll_seconds, self.poll_tries = poll_seconds, poll_tries
@@ -92,12 +96,14 @@ class Train:
         self.path = receipts / f"train-{stamp}-{os.getpid()}-{next(_receipt_serial):04d}.json"
         self.receipt: dict = {
             "schema_version": SCHEMA, "started": stamp, "finished": None,
-            "config": {"jobs": self.jobs, "family_size": self.family_size, "dry_run": dry_run,
+            "config": {"jobs": self.jobs, "family_size": self.family_size, "family_cap": self.family_cap,
+                       "dry_run": dry_run,
                        "rate_floor": rate_floor, "max_rounds": max_rounds,
                        "memory": None if memory is None else {"need_gb": memory.need_gb,
                                                               "reserve_gb": memory.reserve_gb}},
             "requested": [], "prs": {}, "pairs": None, "out": {}, "rounds": [], "families": [], "gates": [],
             "merges": [], "holds": [], "retry_later": [], "pending": [], "alerts": [], "rate_waits": [],
+            "batching": [],
             "api_calls": {}, "surface": dict(self._surface_calls), "stopped": False}
         if tree_provider is not None:
             self.receipt["tree_provider"] = {"consulted": 0, "provider": 0, "git": 0, "reasons": {}}
@@ -520,7 +526,13 @@ class Train:
         self._queue_position = {n: i + 1 for i, n in enumerate(queue)}
         base = self.git.main_sha()
         families = []
-        for part in chunk(queue, self.family_size):
+        size = self.family_size
+        if size == "adaptive":
+            from .batching import choose
+            choice = choose(self.receipts_dir, self.family_cap)
+            size = choice["family_size"]
+            self._add("batching", choice)
+        for part in chunk(queue, size):
             # a family boundary is a planning boundary; the fold continues across it
             family = self.plan(part, families[-1]["commit"] if families else base)
             if family is not None:

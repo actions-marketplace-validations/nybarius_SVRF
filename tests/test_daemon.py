@@ -557,6 +557,66 @@ class BaseBranch(unittest.TestCase):
         self.assertEqual(gh.calls["rest"], rest)
 
 
+class RestackAfterReland(unittest.TestCase):
+    """A stacked pull request whose parent the train re-landed is not stranded: its own
+    commits are replayed onto the ordered branch and a pull request on that branch
+    supersedes it, but only when the rebuilt tree is git's own merge of the two heads."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _relanded_parent(self, repo, gh):
+        admission = Admission({"h210": {"verdict": "HELD", "residuals": ["history:REFUSED:UNORDERED"]}})
+        d = daemon(repo, gh, FakeGate(repo), admission, self.tmp)
+        out = d.tick()
+        self.assertEqual(out["skipped"].get("211"), "WAITING_PARENT")
+        ordered = gh.opened[0]
+        del repo.heads[210]
+        gh.parents = {"pr-210": [{"number": 210, "state": "closed", "merged_at": None}]}
+        pull = gh.pull
+        gh.pull = lambda n: ({"number": n, "head_sha": repo.branches[ordered["head"]], "state": "open"}
+                             if n == ordered["number"] else pull(n))
+        return d, ordered
+
+    def test_a_child_of_a_relanded_parent_is_restacked_onto_the_ordered_branch(self):
+        repo = DaemonRepo([210, 211])
+        gh = DaemonGitHub(repo, bases={211: "pr-210"}, bodies={211: "child body\nCo-Authored-By: X <x@x>\n"})
+        d, ordered = self._relanded_parent(repo, gh)
+        child = repo.heads[211]
+        out = d.tick()
+        self.assertEqual(out["held"], [])
+        restack = gh.opened[1]
+        self.assertEqual((restack["head"], restack["base"]), ("pr-211-restacked", "pr-210-ordered"))
+        self.assertTrue(restack["body"].startswith("Supersedes #211"))
+        self.assertIn("child body", restack["body"])
+        self.assertNotIn("Co-Authored-By", restack["body"])
+        self.assertEqual(out["restacked"], [{"number": 211, "new_number": restack["number"],
+                                             "ref": "pr-211-restacked", "onto": ordered["number"]}])
+        merged = repo.union_step(repo.branches["pr-210-ordered"], child)
+        self.assertEqual(repo.tree(repo.branches["pr-211-restacked"]), merged.tree)
+        self.assertIn(211, gh.closed)
+
+    def test_a_restack_that_is_not_the_merge_of_the_two_heads_is_held(self):
+        repo = DaemonRepo([210, 211], restack_mismatch=True)
+        gh = DaemonGitHub(repo, bases={211: "pr-210"})
+        d, _ = self._relanded_parent(repo, gh)
+        out = d.tick()
+        self.assertEqual(out["held"], [211])
+        self.assertEqual(len(gh.opened), 1)
+        self.assertNotIn(211, gh.closed)
+        rows = json.loads((Path(self.tmp) / "held.json").read_text())["held"]
+        self.assertEqual([r["reason"] for r in rows if r["number"] == 211], ["RESTACK_TREE_MISMATCH"])
+
+    def test_a_dry_run_reports_would_restack_and_touches_nothing(self):
+        repo = DaemonRepo([210, 211])
+        gh = DaemonGitHub(repo, bases={211: "pr-210"})
+        d, _ = self._relanded_parent(repo, gh)
+        d.dry_run = True
+        out = d.tick()
+        self.assertEqual(out["would_restack"], [211])
+        self.assertEqual(len(gh.opened), 1)
+
+
 class UnreadTree(DaemonRepo):
     """A merge commit GitHub made is not in the clone until it is fetched by sha."""
 

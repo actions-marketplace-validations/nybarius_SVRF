@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "svrf"
-version = "0.2.0"
+version = "0.3.0"
 description = "Silicon Valley Rocket Fuel: a merge train for repositories where agents open pull requests faster than CI can gate them one by one"
 readme = "README.md"
 license = "LicenseRef-PolyForm-Shield-1.0.0"

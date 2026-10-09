@@ -155,7 +155,8 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    costs exactly that.
 2. **Admission.** Skip drafts, forks, pull requests with the hold label and ones based
    on another branch. A stacked pull request waits for its parent and is retargeted to
-   the base once the parent merges. Each remaining head gets the admission check: does it
+   the base once the parent merges; if the train re-landed the parent, the child's own commits
+   are restacked onto the ordered branch, but only when the result is git's merge of the two heads. Each remaining head gets the admission check: does it
    merge onto the base, and (optionally) is its history ordered and does your extra
    admission command pass. Up to `admission.slots` heads are read at once, each in its own
    worktree. Completed heads reach the train while other admissions continue; all

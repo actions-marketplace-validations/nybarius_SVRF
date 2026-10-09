@@ -7,8 +7,16 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
 ### Added
 
+- Restack after a re-land: a pull request stacked on a branch the train re-landed is no
+  longer held `PARENT_CLOSED_UNMERGED`. Its own commits are replayed onto the ordered branch
+  (`RealGit.restack`: `merge-tree` + `commit-tree`, author and message kept) and a pull
+  request on that branch supersedes it. This happens only when the ordered pull request is
+  open and the rebuilt tree is exactly git's merge of the two heads; otherwise the child is
+  held `RESTACK_TREE_MISMATCH` or `RESTACK_CONFLICT`. Grandchildren follow.
 - `train.family_size = "adaptive"` with `train.family_cap`: each round chooses the family
   size that minimises expected gate runs per pull request under halving bisection, from the
   red probability estimated by maximum likelihood over the train's own receipts. The choice

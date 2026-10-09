@@ -243,12 +243,14 @@ class Clock:
 class DaemonRepo(FakeRepo):
     """Adds the repair step, head moves, watched-path digests and a fake re-land."""
 
-    def __init__(self, prs, *, repair_conflicts=None, reland_mismatch=False, **kw):
+    def __init__(self, prs, *, repair_conflicts=None, reland_mismatch=False, restack_mismatch=False, **kw):
         super().__init__(prs, **kw)
         self.repair_conflicts = dict(repair_conflicts or {})
         self.repairs = []
         self.reland_mismatch = reland_mismatch
         self.reland_calls = []
+        self.restack_mismatch = restack_mismatch
+        self.restack_calls = []
 
     def repair_step(self, acc, head, message=""):
         self.repairs.append((acc, head))
@@ -274,6 +276,13 @@ class DaemonRepo(FakeRepo):
             return Reland("MISMATCH", tree="Tmismatch", reason="RELAND_TREE_MISMATCH")
         lanes = frozenset(int(x) for x in tree[1:].split(",") if x) if tree.startswith("T") else frozenset()
         sha = self._new(lanes, (base,))
+        return Reland("CLEAN", commits=[sha], tree=self.tree(sha))
+
+    def restack(self, old_parent, child, onto):
+        """The child's own lanes replayed onto `onto`; a mismatch rebuilds a different tree."""
+        self.restack_calls.append((old_parent, child, onto))
+        lanes = self.lanes(child) | self.lanes(onto)
+        sha = self._new(lanes - {max(lanes)} if self.restack_mismatch else lanes, (onto,))
         return Reland("CLEAN", commits=[sha], tree=self.tree(sha))
 
 

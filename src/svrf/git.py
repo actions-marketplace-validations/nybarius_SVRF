@@ -295,6 +295,30 @@ class RealGit:
             return Reland("MISMATCH", tree=parent_tree, reason="RELAND_TREE_MISMATCH")
         return Reland("CLEAN", commits=commits, tree=parent_tree)
 
+    def restack(self, old_parent: str, child: str, onto: str) -> Reland:
+        """Replay `child`'s own commits (the non-merge commits after `old_parent`) onto
+        `onto`, one `merge-tree --write-tree` and `commit-tree` each (no checkout), keeping
+        every commit's author and message. CONFLICT at the first one that does not apply;
+        nothing partial is returned as CLEAN."""
+        try:
+            own = self._out("rev-list", "--reverse", "--no-merges", f"{old_parent}..{child}").split()
+            parent, commits = onto, []
+            for commit in own:
+                done = self._run("merge-tree", "--write-tree", f"--merge-base={commit}^", parent, commit)
+                if done.returncode == 1:
+                    return Reland("CONFLICT", commits=commits, reason=f"RESTACK_CONFLICT:{commit}")
+                if done.returncode != 0:
+                    raise ReadFailed(f"GIT_FAILED:merge-tree:{done.returncode}:{done.stderr.strip()[:160]}")
+                tree = done.stdout.split("\n", 1)[0].strip()
+                name, email, date, message = self._out(
+                    "log", "-1", "--format=%an%x00%ae%x00%aI%x00%B", commit).split("\x00", 3)
+                env = {**self.env, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": date}
+                parent = self._out("commit-tree", tree, "-p", parent, "-F", "-", input=message, env=env)
+                commits.append(parent)
+            return Reland("CLEAN", commits=commits, tree=self.tree(parent))
+        except ReadFailed as failure:
+            return Reland("FAILED", reason=failure.reason)
+
     # ---- writes
 
     def push_branch(self, commit: str, branch: str) -> None:

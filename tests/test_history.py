@@ -66,6 +66,45 @@ class Repo(unittest.TestCase):
         return RealGit(self.work, **kw)
 
 
+class Restacks(Repo):
+    """A child stacked on a parent that was re-landed with an ordered history: the child's
+    own commits are replayed onto the ordered branch, keeping author and message, and the
+    result is git's own merge of the two heads."""
+
+    def test_the_childs_own_commits_land_on_the_ordered_parent_with_the_merged_tree(self):
+        git(self.work, "checkout", "-q", "-b", "parent", self.base)
+        self.write("src/app.py", "value = 2\n")
+        self.commit("feat: app first")
+        self.write("tests/test_app.py", "def test(): pass\n")
+        parent = self.commit("test: app after")
+        git(self.work, "checkout", "-q", "-b", "child", parent)
+        self.write("src/extra.py", "extra = 1\n")
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "--author=Ada <ada@example.com>", "-m", "feat: extra")
+        child = git(self.work, "rev-parse", "HEAD")
+        g = self.rg()
+        ordered = g.reland(self.base, g.tree(parent), "app", KIND).commits[-1]
+        result = g.restack(parent, child, ordered)
+        self.assertEqual((result.status, len(result.commits)), ("CLEAN", 1))
+        self.assertEqual(result.tree, g.tree(child))
+        self.assertEqual(git(self.work, "log", "-1", "--format=%an <%ae>|%s", result.commits[0]),
+                         "Ada <ada@example.com>|feat: extra")
+        self.assertEqual(g.parents(result.commits[0]), [ordered])
+
+    def test_a_commit_that_does_not_apply_is_a_conflict_not_a_partial_restack(self):
+        git(self.work, "checkout", "-q", "-b", "parent", self.base)
+        self.write("src/app.py", "value = 2\n")
+        parent = self.commit("feat: app")
+        git(self.work, "checkout", "-q", "-b", "child", parent)
+        self.write("src/app.py", "value = 3\n")
+        child = self.commit("feat: app again")
+        git(self.work, "checkout", "-q", "-b", "elsewhere", self.base)
+        self.write("src/app.py", "value = 9\n")
+        onto = self.commit("feat: another parent")
+        result = self.rg().restack(parent, child, onto)
+        self.assertEqual(result.status, "CONFLICT")
+
+
 class Dispositions(Repo):
     def test_tests_then_code_then_docs_is_clean(self):
         git(self.work, "checkout", "-q", "-b", "feature", self.base)

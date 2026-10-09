@@ -103,7 +103,7 @@ class Train:
                                                               "reserve_gb": memory.reserve_gb}},
             "requested": [], "prs": {}, "pairs": None, "out": {}, "rounds": [], "families": [], "gates": [],
             "merges": [], "holds": [], "retry_later": [], "pending": [], "alerts": [], "rate_waits": [],
-            "batching": [],
+            "batching": [], "splits": [],
             "api_calls": {}, "surface": dict(self._surface_calls), "stopped": False}
         if tree_provider is not None:
             self.receipt["tree_provider"] = {"consulted": 0, "provider": 0, "git": 0, "reasons": {}}
@@ -463,6 +463,34 @@ class Train:
 
     # ---- bisection
 
+    def _attributed_split(self, numbers: list[int], result: dict, parent: str) -> tuple | None:
+        """The gate's failing lines name what refused. When they name a path that exactly one
+        member changed (the path itself, or the path below its top directory, as a tool
+        rooted there prints it), gate the other members together and that member alone,
+        instead of halves. Only the choice of subsets changes; each verdict is still a gate's
+        own. Anything less exact (no paths read, none or several members named) halves."""
+        lines = "\n".join(str(line) for line in (result.get("failing") or []))
+        changed_paths = getattr(self.git, "changed_paths", None)
+        suspects: dict[int, str] = {}
+        if lines and changed_paths is not None:
+            try:
+                base = self.git.main_sha()
+                for n in numbers:
+                    head = self.rows.get(n, {}).get("head_sha")
+                    for path in changed_paths(base, head) if head else []:
+                        keys = [path] + ([path.split("/", 1)[1]] if "/" in path else [])
+                        if any(key in lines for key in keys):
+                            suspects[n] = path
+                            break
+            except ReadFailed:
+                suspects = {}
+        if len(suspects) == 1:
+            (suspect, path), = suspects.items()
+            self._add("splits", {"family": parent, "kind": "ATTRIBUTED", "suspect": suspect, "path": path})
+            return ([n for n in numbers if n != suspect], [suspect])
+        self._add("splits", {"family": parent, "kind": "HALVED", "named": sorted(suspects)})
+        return None
+
     def settle_red(self, numbers: list[int], result: dict, parent: str) -> list[int]:
         """A red family: a single pull request is held with its failing lines; otherwise
         each half is replanned on the current base and gated, a green half lands and a red
@@ -472,8 +500,9 @@ class Train:
                      gate_seconds=result.get("seconds"))
             return []
         half = len(numbers) // 2
+        parts = self._attributed_split(numbers, result, parent) or (numbers[:half], numbers[half:])
         requeue: list[int] = []
-        for part in (numbers[:half], numbers[half:]):
+        for part in parts:
             if self.stopped:
                 requeue.extend(part)
                 continue

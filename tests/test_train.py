@@ -473,3 +473,44 @@ class RealGitIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttributingRepo(FakeRepo):
+    """A pull request's changed paths are its own lane's test file, as the gate names it."""
+
+    def changed_paths(self, base, head):
+        return [f"tests/test_lane_{lane}.py" for lane in sorted(self.lanes(head) - self.lanes(base) - {0})]
+
+
+class AttributedSplit(unittest.TestCase):
+    """A red family whose failing lines name a path exactly one member changed is split
+    into that member and the rest, instead of halves. The split only chooses which subsets
+    are gated; every verdict is still a gate's own."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_a_named_failure_splits_out_its_one_member(self):
+        repo = AttributingRepo([1, 2, 3, 4, 5, 6])
+        gh, gate = FakeGitHub(repo), FakeGate(repo, bad={4})
+        receipt = train(repo, gh, gate, self.tmp, family_size=8).run([1, 2, 3, 4, 5, 6])
+        self.assertEqual(sorted(gh.merged), [1, 2, 3, 5, 6])
+        self.assertEqual([h["number"] for h in receipt["holds"]], [4])
+        self.assertEqual(len(receipt["gates"]), 3)
+        self.assertEqual([s["kind"] for s in receipt["splits"]], ["ATTRIBUTED"])
+        self.assertEqual((receipt["splits"][0]["suspect"], receipt["splits"][0]["path"]), (4, "tests/test_lane_4.py"))
+
+    def test_a_failure_naming_two_members_is_halved(self):
+        repo = AttributingRepo([1, 2, 3, 4, 5, 6])
+        gh, gate = FakeGitHub(repo), FakeGate(repo, bad={2, 4})
+        receipt = train(repo, gh, gate, self.tmp, family_size=8).run([1, 2, 3, 4, 5, 6])
+        self.assertEqual(sorted(gh.merged), [1, 3, 5, 6])
+        self.assertEqual(sorted(h["number"] for h in receipt["holds"]), [2, 4])
+        self.assertEqual(receipt["splits"][0]["kind"], "HALVED")
+
+    def test_without_changed_paths_the_train_halves_as_before(self):
+        repo = FakeRepo([1, 2, 3, 4, 5, 6])
+        gh, gate = FakeGitHub(repo), FakeGate(repo, bad={4})
+        receipt = train(repo, gh, gate, self.tmp, family_size=8).run([1, 2, 3, 4, 5, 6])
+        self.assertEqual(sorted(gh.merged), [1, 2, 3, 5, 6])
+        self.assertEqual(receipt["splits"][0]["kind"], "HALVED")

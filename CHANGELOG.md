@@ -7,6 +7,14 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
 
 ## [Unreleased]
 
+### Added
+
+- Attributed splitting of a red family. When the gate's failing lines name a path (or that
+  path below its top directory) that exactly one member changed, the family is split into the
+  other members and that member alone, instead of halves. Each part is still gated, so no
+  verdict is inferred, and anything less exact halves as before. Every split is recorded in
+  the receipt under `splits` (`ATTRIBUTED` with the suspect and path, or `HALVED`).
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

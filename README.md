@@ -175,8 +175,10 @@ own production train (see [docs/CASE_STUDY.md](docs/CASE_STUDY.md)):
    base into the branch, check it equals the planned tree, push it to the branch, and
    merge the pull request with a merge commit pinned to that sha. Then fetch the merge
    commit and compare its tree with the gated tree.
-6. **Red.** A red family is bisected; halves are replanned on the current base and gated
-   again. A red single pull request is held with its failing lines.
+6. **Red.** A red family is split and each part is replanned on the current base and gated
+   again. When the gate's failing lines name a path that exactly one member changed, the parts
+   are that member and the rest; otherwise they are halves. A red single pull request is held
+   with its failing lines.
 7. **Memory.** A held pull request is not read again until its head changes or the base
    changes a file its hold depended on.
 

@@ -16,9 +16,13 @@ from svrf.config import ConfigError, from_dict
 MINIMAL = {"repo": "example/project", "gate": {"commands": ["make test"]}}
 
 
-def _receipt(folder: Path, name: str, first_size: int, landed: bool) -> None:
-    family = {"id": "F1", "prs": list(range(1, first_size + 1)), "status": "LANDED" if landed else "BISECTED"}
-    (folder / f"train-{name}.json").write_text(json.dumps({"families": [family]}))
+def _receipt(folder: Path, name: str, first_size: int, landed: bool, heads: dict | None = None) -> None:
+    prs = list(heads) if heads else list(range(1, first_size + 1))
+    family = {"id": "F1", "prs": prs, "status": "LANDED" if landed else "BISECTED"}
+    receipt = {"families": [family]}
+    if heads:
+        receipt["prs"] = {str(n): {"number": n, "head_sha": sha} for n, sha in heads.items()}
+    (folder / f"train-{name}.json").write_text(json.dumps(receipt))
 
 
 class ExpectedCost(unittest.TestCase):
@@ -60,6 +64,26 @@ class RedProbabilityFromReceipts(unittest.TestCase):
             p, n = batching.red_probability(folder)
             self.assertEqual(n, 30)
             self.assertAlmostEqual(p, 1 / 3, places=2)
+
+    def test_a_red_head_regated_across_rounds_is_one_observation(self):
+        # The same pull request at the same head re-gated red in ten rounds is one red arrival,
+        # not ten: the verdict on that exact head was already observed.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            for i in range(10):
+                _receipt(folder, f"r{i}", 1, landed=False, heads={7: "a" * 40})
+            for i in range(9):
+                _receipt(folder, f"g{i}", 1, landed=True, heads={100 + i: f"{i:040d}"})
+            p, n = batching.red_probability(folder)
+            self.assertEqual(n, 10)
+            self.assertAlmostEqual(p, 1 / 10, places=2)
+
+    def test_a_moved_head_is_a_new_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            _receipt(folder, "r0", 1, landed=False, heads={7: "a" * 40})
+            _receipt(folder, "r1", 1, landed=True, heads={7: "b" * 40})
+            self.assertEqual(batching.red_probability(folder)[1], 2)
 
     def test_no_receipts_is_unknown_not_zero(self):
         with tempfile.TemporaryDirectory() as tmp:

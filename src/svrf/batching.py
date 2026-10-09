@@ -9,7 +9,9 @@ per-pull-request red probability `p` the expected gate runs for a family of `k` 
 and the size chosen is the one minimising E(k)/k for k in 1..cap (ties keep the larger k).
 
 `p` is the maximum-likelihood estimate from each retained round's first family: its size
-and whether it landed whole. No receipts means `p` is unknown and the cap is kept; nothing
+and whether it landed whole. A family is one observation per exact set of (pull request,
+head) pairs, its latest outcome: re-gating an unchanged red head in later rounds observes
+the same verdict again, not a new red arrival. A receipt without heads is its own key. No receipts means `p` is unknown and the cap is kept; nothing
 here invents a rate."""
 
 from __future__ import annotations
@@ -43,19 +45,24 @@ def optimal_family_size(p: float | None, cap: int) -> int:
 
 
 def _observations(receipts: Path) -> list[tuple[int, bool]]:
-    rows = []
+    rows: dict = {}
     for path in sorted(Path(receipts).glob("train-*.json")):
         try:
-            families = json.loads(path.read_text()).get("families") or []
+            receipt = json.loads(path.read_text())
+            families = receipt.get("families") or []
+            heads = receipt.get("prs") or {}
         except (OSError, ValueError, AttributeError):
             continue
-        if not families:
+        if not families or not isinstance(heads, dict):
             continue
         first = families[0]
-        size = len(first.get("prs") or [])
-        if size:
-            rows.append((size, first.get("status") == "LANDED"))
-    return rows
+        prs = first.get("prs") or []
+        if not prs:
+            continue
+        shas = tuple((n, (heads.get(str(n)) or {}).get("head_sha")) for n in prs)
+        key = shas if all(sha for _, sha in shas) else str(path)
+        rows[key] = (len(prs), first.get("status") == "LANDED")
+    return list(rows.values())
 
 
 def red_probability(receipts: Path) -> tuple[float | None, int]:

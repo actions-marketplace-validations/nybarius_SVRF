@@ -56,11 +56,15 @@ def _read_basis(path: Path, head: str, base: str) -> list[dict] | None:
             raise ValueError("OCCURRENCE")
         for row in value["consumed"]:
             if (not isinstance(row, dict) or set(row) != {"kind", "id"}
-                    or row["kind"] not in ("PATH", "DIR", "CODE", "COMMIT")
+                    or row["kind"] not in ("PATH", "DIR", "CODE", "COMMIT", "BASE_NYMISH_PAYLOAD")
                     or not isinstance(row["id"], str) or not row["id"]
                     or any(ord(c) < 32 for c in row["id"])):
                 raise ValueError("ROW")
             if row["kind"] == "COMMIT":
+                continue
+            if row["kind"] == "BASE_NYMISH_PAYLOAD":
+                if not rules.is_base_payload_id(row["id"]):
+                    raise ValueError("PAYLOAD")
                 continue
             name = row["id"]
             if row["kind"] == "DIR":

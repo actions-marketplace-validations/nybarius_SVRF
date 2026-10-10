@@ -299,7 +299,8 @@ class Daemon:
                         self.reland(row, cls, state, summary)
                     elif decision in ("HOLD", "REPAIR"):
                         self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                                  extra=self._watch(base, self._consumed_paths(value)))
+                                  extra=self._watch(base, self._consumed_paths(value),
+                                                    payloads=self._consumed_payloads(value)))
                     else:
                         self._retry(summary, n, cls or "ADMISSION_UNREAD")
                 summary["admitted"] = sorted(admitted)
@@ -368,7 +369,8 @@ class Daemon:
         """The base branch's content over a held head's watched paths now, or None when it
         cannot be read or the head moved anyway. The base is read once per round and
         fetched only when it moved since the hold."""
-        if not held or not held.get("watch") or held.get("head") != row.get("headRefOid"):
+        if (not held or not (held.get("watch") or held.get("payload_watch"))
+                or held.get("head") != row.get("headRefOid")):
             return None
         digest = getattr(self.git, "watch_digest", None)
         if digest is None:
@@ -378,10 +380,12 @@ class Daemon:
                 base_now["sha"] = self.git.main_sha()
             if base_now["sha"] == held.get("base_sha"):
                 return held.get("watch_digest")
-            if not base_now["fetched"]:
+            if not base_now.get("fetched", True):
                 self.git.fetch([])
                 base_now["fetched"] = True
-            value = digest(base_now["sha"], held["watch"])
+            payloads = held.get("payload_watch") or []
+            value = digest(base_now["sha"], held.get("watch") or [],
+                           **({"payloads": payloads} if payloads else {}))
         except ReadFailed:
             return None
         if value == held.get("watch_digest"):
@@ -404,13 +408,23 @@ class Daemon:
                 paths.add(row["id"][4:])
         return sorted(paths)
 
-    def _watch(self, base: str | None, paths: list[str]) -> dict:
+    @staticmethod
+    def _consumed_payloads(value: dict) -> list[str]:
+        """Payload identities stay separate from filesystem paths."""
+        return sorted({row["id"] for row in value.get("consumed") or []
+                       if isinstance(row, dict) and row.get("kind") == "BASE_NYMISH_PAYLOAD"
+                       and isinstance(row.get("id"), str) and row["id"]})
+
+    def _watch(self, base: str | None, paths: list[str], *, payloads=()) -> dict:
         digest = getattr(self.git, "watch_digest", None)
         paths = sorted(set(paths) | set(self.admission_watch))
-        if not paths or base is None or digest is None:
+        payloads = sorted(set(payloads))
+        if not (paths or payloads) or base is None or digest is None:
             return {}
         try:
-            return {"watch": paths, "base_sha": base, "watch_digest": digest(base, paths)}
+            value = digest(base, paths, **({"payloads": payloads} if payloads else {}))
+            return {"watch": paths, "base_sha": base, "watch_digest": value,
+                    **({"payload_watch": payloads} if payloads else {})}
         except ReadFailed:
             return {}
 
@@ -658,7 +672,8 @@ class Daemon:
         residuals = list(value.get("residuals") or [])
         if value.get("verdict") == "HELD" and residuals:
             self.hold(row, "RELAND_ADMISSION_HELD", state, summary, failing=residuals, cls=cls,
-                      extra={**self._watch(base_sha, self._consumed_paths(value)), "repair_head": final})
+                      extra={**self._watch(base_sha, self._consumed_paths(value),
+                                           payloads=self._consumed_payloads(value)), "repair_head": final})
             return
         if (value.get("verdict") != "MERGEABLE" or residuals
                 or (value.get("admission") or {}).get("complete", True) is not True):

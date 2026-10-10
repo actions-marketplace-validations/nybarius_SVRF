@@ -18,7 +18,7 @@ from typing import Callable
 
 from .errors import ReadFailed
 from .redact import redact
-from .rules import union_attributes
+from .rules import is_base_payload_id, union_attributes
 
 
 @dataclass
@@ -114,9 +114,24 @@ class RealGit:
         """Paths the pull request changes relative to its merge base with `base`."""
         return [p for p in self._out("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines() if p]
 
-    def watch_digest(self, commit: str, paths: list[str]) -> str:
-        """A digest of `commit`'s content over `paths`: equal digests, equal content there."""
+    def watch_digest(self, commit: str, paths: list[str], *, payloads=()) -> str:
+        """Content at the requested paths, plus requested regular Nymish payload presence."""
         listing = self._out("ls-tree", "-r", "--full-tree", commit, "--", *sorted(set(paths))) if paths else ""
+        if payloads:
+            if any(not isinstance(key, str) or not is_base_payload_id(key) for key in payloads):
+                raise ReadFailed("WATCH_PAYLOAD_INVALID")
+            done = self._raw("ls-tree", "-rz", "--full-tree", commit)
+            if done.returncode:
+                raise ReadFailed("WATCH_PAYLOAD_BASE_UNREADABLE")
+            present = set()
+            for entry in done.stdout.split(b"\0"):
+                if not entry:
+                    continue
+                metadata, name = entry.split(b"\t", 1)
+                mode, kind, blob = metadata.decode("ascii").split()
+                if kind == "blob" and mode in ("100644", "100755") and name.endswith(b".nym"):
+                    present.add(f"nymish-base-payload:{mode}:{kind}:{blob}")
+            listing += "\0" + "\0".join(f"{key}={int(key in present)}" for key in sorted(set(payloads)))
         return "sha256:" + hashlib.sha256(listing.encode()).hexdigest()
 
     def merge_preview(self, a: str, b: str) -> dict:

@@ -49,6 +49,11 @@ RULES: dict[str, dict[str, str]] = {
 # --------------------------------------------------------------------------- merging
 
 
+def is_base_payload_id(value: str) -> bool:
+    """An exact regular-blob key in the admission dependency protocol."""
+    return re.fullmatch(r"nymish-base-payload:(100644|100755):blob:([0-9a-f]{40}|[0-9a-f]{64})", value) is not None
+
+
 def union_attributes(text: str, names) -> str:
     """A directory's `.gitattributes` body (`text`, possibly empty) with git's union merge
     (`merge=union`) declared for each file name in `names`, after everything `text` already

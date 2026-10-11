@@ -168,7 +168,8 @@ class Rounds(unittest.TestCase):
         out = daemon(repo, gh, FakeGate(repo), admission, self.tmp).tick()
         self.assertEqual(out["tick"], "RAN")
         self.assertEqual(out["admitted"], [11, 12, 13])
-        self.assertEqual(gh.merged, [11, 12, 13])
+        # with a backlog the newest head is read (and lands) first; the landed set is what this round asserts
+        self.assertEqual(sorted(gh.merged), [11, 12, 13])
         self.assertEqual(gh.calls["graphql"], 1)
         self.assertEqual(len(admission.calls), 3)
         self.assertTrue(Path(out["receipt"]).is_file())
@@ -206,6 +207,23 @@ class Rounds(unittest.TestCase):
         guard = MemoryGuard(need_gb=10, reserve_gb=8, available_gb=lambda: 20, sleep=lambda s: _time.sleep(0.01))
         daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=3, memory=guard).tick()
         self.assertEqual(admission.peak, 1)
+
+    def test_a_backlog_is_read_newest_first_with_last_ticks_unread_heads_last(self):
+        # A host read ~130 heads oldest first through four slots; the oldest were mostly held again or unread under IO
+        # pressure, so fresh, gated heads reached a slot about two hours into the round and nothing landed before.
+        # When candidates outnumber the admission slots, every candidate is still read this tick, but the newest
+        # first and a head whose read failed last tick (retry_later) after the rest.
+        from svrf.daemon import STATE_SCHEMA
+        repo = DaemonRepo([41, 42, 43, 44])
+        gh = DaemonGitHub(repo)
+        Path(self.tmp, "state.json").write_text(json.dumps({
+            "schema_version": STATE_SCHEMA, "held": {}, "merged_elsewhere": {}, "relanded": {}, "bases": {},
+            "last_tick": {"retry_later": [44]}}))
+        admission = Admission()
+        number_of = {sha: n for n, sha in repo.heads.items()}
+        out = daemon(repo, gh, FakeGate(repo), admission, self.tmp, jobs=1, admission_jobs=1).tick()
+        self.assertEqual(sorted(out["admitted"]), [41, 42, 43, 44])
+        self.assertEqual([number_of[head] for head, _ in admission.calls], [43, 42, 41, 44])
 
     def test_skips_drafts_forks_other_bases_and_the_hold_label(self):
         repo = DaemonRepo([21, 22, 23, 24, 25])

@@ -144,3 +144,40 @@ class TrainUsesTheChosenSize(unittest.TestCase):
             self.assertEqual(receipt["batching"][0]["family_size"], 1)
             self.assertEqual(gh.merged, [1, 2, 3])
             self.assertTrue(all(len(f["prs"]) == 1 for f in receipt["families"]))
+
+
+class ExactCost(unittest.TestCase):
+    """The cost model's own process, enumerated: every red/green assignment of k independent members, a
+    family gated once, a red family halved (floor, ceil) and each half gated in turn. The expected gate
+    count is that enumeration, not the product of unconditional child expectations with the red-parent
+    probability: a red parent changes what its halves cost."""
+
+    @staticmethod
+    def enumerate_gates(k, p):
+        from itertools import product
+
+        def cost(bits):
+            if not any(bits):
+                return 1
+            if len(bits) == 1:
+                return 1
+            a = len(bits) // 2
+            return 1 + cost(bits[:a]) + cost(bits[a:])
+        total = 0.0
+        for bits in product((0, 1), repeat=k):
+            weight = 1.0
+            for red in bits:
+                weight *= p if red else 1 - p
+            total += weight * cost(bits)
+        return total
+
+    def test_the_expected_gates_are_the_enumerated_process(self):
+        for p in (0.5, 0.17, 0.05):
+            for k in range(1, 9):
+                self.assertAlmostEqual(batching.expected_gates_per_pr(k, p) * k, self.enumerate_gates(k, p), places=9,
+                                       msg=(k, p))
+
+    def test_the_chosen_size_minimises_the_enumerated_cost(self):
+        for p, cap in ((0.17, 8), (0.05, 8), (0.02, 16)):
+            best = min(range(1, cap + 1), key=lambda k: (self.enumerate_gates(k, p) / k, -k))
+            self.assertEqual(batching.optimal_family_size(p, cap=cap), best, (p, cap))

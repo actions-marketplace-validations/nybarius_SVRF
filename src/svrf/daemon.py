@@ -242,6 +242,12 @@ class Daemon:
                 self.stacked(row, heads, state, summary)
             else:
                 summary["skipped"][str(n)] = decision
+        # A backlog (more candidates than admission slots) is read newest first, and a head whose read failed last
+        # tick after the rest, so old or unread heads never hold fresh admissions behind them; every candidate is
+        # still read this tick. Without a backlog every read starts at once and the order is kept.
+        if len(candidates) > max(1, self.admission_jobs):
+            unread = {int(n) for n in (state.get("last_tick") or {}).get("retry_later") or [] if str(n).isdigit()}
+            candidates.sort(key=lambda r: (int(r["number"]) in unread, -int(r["number"])))
         if not candidates:
             self.save(state, summary)
             return summary

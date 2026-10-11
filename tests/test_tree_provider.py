@@ -161,7 +161,7 @@ class TrainWithProvider(unittest.TestCase):
                    clock=clock, sleep=clock.sleep, is_union=is_union,
                    train_options={"poll_seconds": 0, "tree_provider": FakeProvider(repo)})
         out = d.tick()
-        self.assertEqual(out["merged"], [11, 12])
+        self.assertEqual(sorted(out["merged"]), [11, 12])  # landing follows admission order under a backlog
         self.assertEqual(out["tree_provider"], {"consulted": 4, "provider": 4, "git": 0, "reasons": {}})
         state = json.loads((Path(self.tmp) / "state.json").read_text())
         self.assertEqual(state["last_tick"]["tree_provider"]["provider"], 4)

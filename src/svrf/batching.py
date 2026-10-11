@@ -4,9 +4,12 @@ A family of `k` pull requests costs one gate when every member is green; when an
 is red the family is halved and each half is gated in turn (the train's bisection). With a
 per-pull-request red probability `p` the expected gate runs for a family of `k` are
 
-    E(1) = 1,    E(k) = 1 + (1 - (1-p)^k) * (E(floor(k/2)) + E(ceil(k/2)))
+    E(1) = 1,    E(k) = 1 + E(floor(k/2)) + E(ceil(k/2)) - 2 (1-p)^k
 
-and the size chosen is the one minimising E(k)/k for k in 1..cap (ties keep the larger k).
+exactly: pointwise the family costs 1 + T(a) + T(b) when any member is red, and 1 when all are
+green, which is 1 + T(a) + T(b) - 2 since both all-green halves would cost 1 each. (Multiplying
+the unconditional half expectations by the red-parent probability undercounts: a red parent
+changes what its halves cost.) The size chosen is the one minimising E(k)/k for k in 1..cap (ties keep the larger k).
 
 `p` is the maximum-likelihood estimate from each retained round's first family: its size
 and whether it landed whole. A family is one observation per exact set of (pull request,
@@ -28,7 +31,7 @@ def expected_gates_per_pr(k: int, p: float) -> float:
         if n <= 1:
             return 1.0
         a = n // 2
-        return 1.0 + (1.0 - (1.0 - p) ** n) * (gates(a) + gates(n - a))
+        return 1.0 + gates(a) + gates(n - a) - 2.0 * (1.0 - p) ** n
     return gates(k) / k
 
 

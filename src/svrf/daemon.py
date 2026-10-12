@@ -69,7 +69,8 @@ class Daemon:
                  is_union: Callable[[str], bool] = lambda p: False, repair: bool = True, reland: bool = True,
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
                  admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None,
-                 admission_jobs: int | None = None, admission_capacity_command: str | None = None):
+                 admission_jobs: int | None = None, admission_capacity_command: str | None = None,
+                 admission_priority_command: str | None = None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -94,6 +95,7 @@ class Daemon:
         # admission reads overlap up to their own count; None borrows the gate's jobs as before
         self.admission_jobs = max(1, admission_jobs) if admission_jobs else self.jobs
         self.admission_capacity_command = admission_capacity_command
+        self.admission_priority_command = admission_priority_command
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
 
@@ -151,20 +153,35 @@ class Daemon:
 
     # ---- one round
 
-    def _admission_capacity(self) -> tuple[int | None, str | None]:
-        """The round's admission capacity: the last line of the capacity command's output, a whole number. A command
-        that fails, times out or prints anything else is an unobserved read, never a guessed width."""
+    @staticmethod
+    def _read_lines(command: str) -> tuple[list[str] | None, str | None]:
+        """A host command's non-empty output lines, or why they could not be read."""
         try:
-            done = subprocess.run(["bash", "-c", self.admission_capacity_command], capture_output=True, text=True,
-                                  timeout=120)
+            done = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as error:
             return None, type(error).__name__.upper()
         if done.returncode != 0:
             return None, f"EXIT:{done.returncode}"
-        lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+        return [line.strip() for line in done.stdout.splitlines() if line.strip()], None
+
+    def _admission_capacity(self) -> tuple[int | None, str | None]:
+        """The round's admission capacity: the last line of the capacity command's output, a whole number. A command
+        that fails, times out or prints anything else is an unobserved read, never a guessed width."""
+        lines, failure = self._read_lines(self.admission_capacity_command)
+        if lines is None:
+            return None, failure
         if not lines or not lines[-1].isdigit():
             return None, "NOT_A_COUNT"
         return int(lines[-1]), None
+
+    def _read_numbers(self, command: str) -> tuple[list[int] | None, str | None]:
+        """Pull-request numbers, one per line, in the order the command prints them."""
+        lines, failure = self._read_lines(command)
+        if lines is None:
+            return None, failure
+        if not all(line.isdigit() for line in lines):
+            return None, "NOT_A_NUMBER"
+        return [int(line) for line in lines], None
 
     def tick(self) -> dict:
         with owner_lock(self.lock_path) as owned:
@@ -264,7 +281,16 @@ class Daemon:
         # still read this tick. Without a backlog every read starts at once and the order is kept.
         if len(candidates) > max(1, self.admission_jobs):
             unread = {int(n) for n in (state.get("last_tick") or {}).get("retry_later") or [] if str(n).isdigit()}
-            candidates.sort(key=lambda r: (int(r["number"]) in unread, -int(r["number"])))
+            rank: dict[int, int] = {}
+            if self.admission_priority_command:
+                # declared heads lead the backlog in their order; an unreadable declaration keeps the usual order
+                read, failure = self._read_numbers(self.admission_priority_command)
+                summary["admission_priority"] = ({"command": self.admission_priority_command, "read": read}
+                                                 if read is not None else
+                                                 {"command": self.admission_priority_command, "UNOBSERVED": failure})
+                rank = {n: i for i, n in reversed(list(enumerate(read or [])))}
+            candidates.sort(key=lambda r: (rank.get(int(r["number"]), len(rank)), int(r["number"]) in unread,
+                                           -int(r["number"])))
         if not candidates:
             self.save(state, summary)
             return summary

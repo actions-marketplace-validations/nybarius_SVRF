@@ -70,7 +70,7 @@ class Daemon:
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
                  admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None,
                  admission_jobs: int | None = None, admission_capacity_command: str | None = None,
-                 admission_priority_command: str | None = None):
+                 admission_priority_command: str | None = None, admission_round_reads: int | None = None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -96,6 +96,7 @@ class Daemon:
         self.admission_jobs = max(1, admission_jobs) if admission_jobs else self.jobs
         self.admission_capacity_command = admission_capacity_command
         self.admission_priority_command = admission_priority_command
+        self.admission_round_reads = admission_round_reads
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
 
@@ -127,7 +128,7 @@ class Daemon:
             return
         state["last_tick"] = {k: summary[k] for k in (
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
-            "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider",
+            "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -279,7 +280,16 @@ class Daemon:
         # A backlog (more candidates than admission slots) is read newest first, and a head whose read failed last
         # tick after the rest, so old or unread heads never hold fresh admissions behind them; every candidate is
         # still read this tick. Without a backlog every read starts at once and the order is kept.
-        if len(candidates) > max(1, self.admission_jobs):
+        bounded = bool(self.admission_round_reads) and len(candidates) > self.admission_round_reads
+        if self.admission_round_reads:
+            # every candidate waits from when it is first seen, and again from each read of it; a head that is no
+            # longer a candidate (landed, closed, held) leaves the queue
+            current = {str(row["number"]) for row in candidates}
+            waiting = {n: t for n, t in (state.get("waiting_since") or {}).items() if n in current}
+            for n in current:
+                waiting.setdefault(n, self.clock())
+            state["waiting_since"] = waiting
+        if bounded or len(candidates) > max(1, self.admission_jobs):
             unread = {int(n) for n in (state.get("last_tick") or {}).get("retry_later") or [] if str(n).isdigit()}
             rank: dict[int, int] = {}
             if self.admission_priority_command:
@@ -289,8 +299,17 @@ class Daemon:
                                                  if read is not None else
                                                  {"command": self.admission_priority_command, "UNOBSERVED": failure})
                 rank = {n: i for i, n in reversed(list(enumerate(read or [])))}
-            candidates.sort(key=lambda r: (rank.get(int(r["number"]), len(rank)), int(r["number"]) in unread,
-                                           -int(r["number"])))
+            if bounded:
+                # a bounded round reads the declared first, then whoever has waited longest (the older on a tie),
+                # and ends; the next round lists again, so no head waits a whole long round for its turn
+                waiting = state["waiting_since"]
+                candidates.sort(key=lambda r: (rank.get(int(r["number"]), len(rank)),
+                                               float(waiting.get(str(r["number"]), 0.0)), int(r["number"])))
+                summary["deferred"] = [int(r["number"]) for r in candidates[self.admission_round_reads:]]
+                candidates = candidates[:self.admission_round_reads]
+            else:
+                candidates.sort(key=lambda r: (rank.get(int(r["number"]), len(rank)), int(r["number"]) in unread,
+                                               -int(r["number"])))
         if not candidates:
             self.save(state, summary)
             return summary
@@ -341,6 +360,8 @@ class Daemon:
                     row = pending.pop(future)
                     n = int(row["number"])
                     value, failure = future.result()
+                    if self.admission_round_reads:
+                        state.setdefault("waiting_since", {})[str(n)] = self.clock()
                     if failure is not None:
                         if isinstance(failure, ReadFailed):
                             self._retry(summary, n, failure.reason)

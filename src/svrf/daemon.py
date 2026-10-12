@@ -32,6 +32,7 @@ A round:
 
 from __future__ import annotations
 
+import subprocess
 import json
 import math
 import time
@@ -68,7 +69,7 @@ class Daemon:
                  is_union: Callable[[str], bool] = lambda p: False, repair: bool = True, reland: bool = True,
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
                  admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None,
-                 admission_jobs: int | None = None):
+                 admission_jobs: int | None = None, admission_capacity_command: str | None = None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -92,6 +93,7 @@ class Daemon:
         self.jobs, self.memory = max(1, jobs), memory
         # admission reads overlap up to their own count; None borrows the gate's jobs as before
         self.admission_jobs = max(1, admission_jobs) if admission_jobs else self.jobs
+        self.admission_capacity_command = admission_capacity_command
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
 
@@ -148,6 +150,21 @@ class Daemon:
             return summary
 
     # ---- one round
+
+    def _admission_capacity(self) -> tuple[int | None, str | None]:
+        """The round's admission capacity: the last line of the capacity command's output, a whole number. A command
+        that fails, times out or prints anything else is an unobserved read, never a guessed width."""
+        try:
+            done = subprocess.run(["bash", "-c", self.admission_capacity_command], capture_output=True, text=True,
+                                  timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return None, type(error).__name__.upper()
+        if done.returncode != 0:
+            return None, f"EXIT:{done.returncode}"
+        lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+        if not lines or not lines[-1].isdigit():
+            return None, "NOT_A_COUNT"
+        return int(lines[-1]), None
 
     def tick(self) -> dict:
         with owner_lock(self.lock_path) as owned:
@@ -271,7 +288,22 @@ class Daemon:
             inputs["admission_base"] = base
             if self.admission_watch:
                 inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
-        executor = ThreadPoolExecutor(max_workers=self.admission_jobs, thread_name_prefix="admission")
+        slots = self.admission_jobs
+        if self.admission_capacity_command:
+            capacity, unread = self._admission_capacity()
+            if capacity is None or capacity == 0:
+                summary["admission_capacity"] = ({"command": self.admission_capacity_command, "UNOBSERVED": unread}
+                                                 if capacity is None else
+                                                 {"command": self.admission_capacity_command, "value": 0, "slots": 0})
+                reason = f"ADMISSION_CAPACITY_UNOBSERVED:{unread}" if capacity is None else "ADMISSION_CAPACITY:0"
+                for row in candidates:
+                    self._retry(summary, int(row["number"]), reason)
+                self.save(state, summary)
+                return summary
+            slots = min(slots, capacity)
+            summary["admission_capacity"] = {"command": self.admission_capacity_command, "value": capacity,
+                                             "slots": slots}
+        executor = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="admission")
         try:
             pending = {executor.submit(self._read_admission, row, base): row for row in candidates}
             while pending:

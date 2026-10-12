@@ -82,6 +82,8 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
                   is_union=union, repair=config.repair, jobs=config.train.jobs, memory=memory,
                   admission_jobs=config.admission_slots,
                   admission_capacity_command=config.admission_capacity_command,
+                  admission_priority_command=config.admission_priority_command,
+                  admission_round_reads=config.admission_round_reads,
                   # history.reland alone gates this: reland_class only ever returns a class
                   # from a `history:REFUSED:` residual (the built-in tests-first check,
                   # order != "off") or a `reland:REFUSED:` one an admission.command reports

@@ -81,6 +81,8 @@ class Config:
     admission_timeout_minutes: float = 10
     admission_slots: int | None = None   # None: borrow train.jobs
     admission_capacity_command: str | None = None   # None: the configured slots are the round's concurrency
+    admission_priority_command: str | None = None   # None: a backlog reads newest first, last tick's unread last
+    admission_round_reads: int | None = None   # None: a round reads every candidate
     demand_driver: str = ""
     admission_watch: list[str] = field(default_factory=list)
     gate: GateConfig = field(default_factory=GateConfig)
@@ -138,12 +140,22 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     kwargs["union_merge"] = list(repair.get("union_merge") or [])
     kwargs["repair"] = bool(repair.get("enabled", True))
     admission = value.get("admission") or {}
-    if set(admission) - {"command", "watch", "timeout_minutes", "slots", "capacity_command"}:
-        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes', 'slots', 'capacity_command'})}")
+    known = {"command", "watch", "timeout_minutes", "slots", "capacity_command", "priority_command", "round_reads"}
+    if set(admission) - known:
+        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - known)}")
     if "capacity_command" in admission:
         if not isinstance(admission["capacity_command"], str) or not admission["capacity_command"].strip():
             raise ConfigError("[admission] capacity_command must be a command line")
         kwargs["admission_capacity_command"] = admission["capacity_command"]
+    if "priority_command" in admission:
+        if not isinstance(admission["priority_command"], str) or not admission["priority_command"].strip():
+            raise ConfigError("[admission] priority_command must be a command line")
+        kwargs["admission_priority_command"] = admission["priority_command"]
+    if "round_reads" in admission:
+        reads = admission["round_reads"]
+        if isinstance(reads, bool) or not isinstance(reads, int) or reads < 1:
+            raise ConfigError("[admission] round_reads must be a whole number of at least 1")
+        kwargs["admission_round_reads"] = reads
     if "slots" in admission:
         slots = admission["slots"]
         if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:

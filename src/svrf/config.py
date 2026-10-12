@@ -80,6 +80,7 @@ class Config:
     admission_command: str = ""
     admission_timeout_minutes: float = 10
     admission_slots: int | None = None   # None: borrow train.jobs
+    admission_capacity_command: str | None = None   # None: the configured slots are the round's concurrency
     demand_driver: str = ""
     admission_watch: list[str] = field(default_factory=list)
     gate: GateConfig = field(default_factory=GateConfig)
@@ -137,8 +138,12 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     kwargs["union_merge"] = list(repair.get("union_merge") or [])
     kwargs["repair"] = bool(repair.get("enabled", True))
     admission = value.get("admission") or {}
-    if set(admission) - {"command", "watch", "timeout_minutes", "slots"}:
-        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes', 'slots'})}")
+    if set(admission) - {"command", "watch", "timeout_minutes", "slots", "capacity_command"}:
+        raise ConfigError(f"unknown keys in [admission]: {sorted(set(admission) - {'command', 'watch', 'timeout_minutes', 'slots', 'capacity_command'})}")
+    if "capacity_command" in admission:
+        if not isinstance(admission["capacity_command"], str) or not admission["capacity_command"].strip():
+            raise ConfigError("[admission] capacity_command must be a command line")
+        kwargs["admission_capacity_command"] = admission["capacity_command"]
     if "slots" in admission:
         slots = admission["slots"]
         if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:

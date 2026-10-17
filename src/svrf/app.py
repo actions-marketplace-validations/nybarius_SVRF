@@ -76,7 +76,7 @@ def build(config: Config, *, github=None, dry_run: bool = False, clock=None, sle
             extra["demand"] = demand
         except (ImportError, AttributeError, TypeError, ValueError) as exc:
             raise ConfigError(f"demand driver unavailable: {exc}") from exc
-    return Daemon(git, github or RealGitHub(config.repo), gate, admission, state_dir=config.state_dir,
+    return Daemon(git, github or RealGitHub(config.repo, limit=config.train.snapshot_limit), gate, admission, state_dir=config.state_dir,
                   receipts=config.receipts, base=config.base, dry_run=dry_run, rate_floor=config.train.rate_floor,
                   lock_path=config.lock, hold_label=config.hold_label, admission_watch=config.admission_watch,
                   is_union=union, repair=config.repair, jobs=config.train.jobs, memory=memory,

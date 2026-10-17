@@ -40,6 +40,7 @@ class TrainConfig:
     max_rounds: int = 3
     rate_floor: int = 200
     comment: bool = True
+    snapshot_limit: int = 1000       # the most open pull requests one snapshot lists (ten 100-row pages)
     interval_seconds: float = 300
     tick_seconds: float | None = None  # a tick ends after this long; reads still running carry into the next (watch)
 
@@ -177,6 +178,9 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
         if bad:
             raise ConfigError(f"unknown keys in [{name}]: {', '.join(bad)}")
         kwargs[name] = cls(**section)
+    limit = kwargs["train"].snapshot_limit
+    if type(limit) is not int or limit < 1:
+        raise ConfigError("[train] snapshot_limit must be a positive whole count")
     for key in ("clone", "state_dir"):
         if key in kwargs:
             path = Path(os.path.expandvars(str(kwargs[key]))).expanduser()

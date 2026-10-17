@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None, *, github=None) -> int:
         except ReadFailed as failure:
             _print({"tick": "RETRY", "reason": failure.reason})
             return 0
-        hub = github or RealGitHub(config.repo)
+        hub = github or RealGitHub(config.repo, limit=config.train.snapshot_limit)
         git = RealGit(config.clone, base=config.base)
         numbers = _numbers(args.merged)
         found, problems = replayer.reconstruct(git, hub.merge_commit, numbers)

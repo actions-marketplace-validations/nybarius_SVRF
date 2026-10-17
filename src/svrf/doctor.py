@@ -114,7 +114,7 @@ def run(config: Config, *, github=None, subprocess_run=_run) -> list[Check]:
     if github is None:
         from .github import RealGitHub
 
-        github = RealGitHub(config.repo)
+        github = RealGitHub(config.repo, limit=config.train.snapshot_limit)
     return [
         check_git(subprocess_run),
         check_gh(subprocess_run),

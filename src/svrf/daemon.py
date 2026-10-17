@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import rules
+from .admission import Admission
 from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
 from .train import Train
@@ -212,11 +213,13 @@ class Daemon:
         also uses (the admission command can run the same heavy suite), so this and a
         running gate never together exceed the host's reserved memory."""
         head = row.get("headRefOid")
+        # Only the built-in Admission takes the PR number (SVRF_PR); other callables keep (head, base).
+        extra = (row["number"],) if isinstance(self.admission, Admission) and row.get("number") is not None else ()
         try:
             if self.memory is not None:
                 with self.memory.admit():
-                    return self.admission(head, base), None
-            return self.admission(head, base), None
+                    return self.admission(head, base, *extra), None
+            return self.admission(head, base, *extra), None
         except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
             return None, error
 

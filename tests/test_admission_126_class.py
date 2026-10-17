@@ -38,7 +38,8 @@ class Exit126(unittest.TestCase):
                 self.assertEqual(self.reason(printing("noise before", line)), line)
 
     def test_the_class_line_is_read_from_error_output_too_and_the_last_one_wins(self):
-        self.assertEqual(self.reason("echo IO_POOL_CAPACITY >&2; echo INTAKE_BUDGET_YIELD:1/2; exit 126"),
+        self.assertEqual(self.reason("echo IO_POOL_CAPACITY >&2; exit 126"), "IO_POOL_CAPACITY")
+        self.assertEqual(self.reason(printing("IO_POOL_CAPACITY", "INTAKE_BUDGET_YIELD:1/2")),
                          "INTAKE_BUDGET_YIELD:1/2")
 
     def test_no_class_line_keeps_the_bare_code(self):
@@ -54,6 +55,8 @@ class Exit126(unittest.TestCase):
             with self.subTest(line=line), tempfile.TemporaryDirectory() as tmp:
                 repo = DaemonRepo([31])
                 repo.root = Path(tmp)
+                repo.merge_preview = lambda *a: {"status": "CLEAN", "conflicts": []}
+                repo.changed_paths = lambda *a: ["lane:31"]
                 gh = DaemonGitHub(repo)
                 owner = daemon(repo, gh, FakeGate(repo), Admission(repo, command=printing(line)), tmp, jobs=1)
                 result = owner.tick()

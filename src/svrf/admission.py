@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,11 @@ from .locks import SlotPool
 from .redact import redact
 
 UNAVAILABLE_EXITS = (126, 127)
+# The projected reason a command names on its output before exiting 126: an unobserved IO charge, a full IO
+# pool, a budgeted intake that yielded part-way, or an output it could not observe. Each is a read not made
+# (retry_later), never a verdict.
+UNAVAILABLE_CLASS = re.compile(
+    r"^(IO_CHARGE_UNOBSERVED:\S+|IO_POOL_CAPACITY|INTAKE_BUDGET_YIELD:\d+/\d+|INTAKE_OUTPUT_UNOBSERVED:\S+)$")
 
 
 def _unique(pairs):
@@ -169,6 +175,11 @@ class Admission:
             raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
+            if done.returncode == 126:
+                named = [line[:200] for line in (ln.strip() for ln in redact(done.stdout + done.stderr, env).splitlines())
+                         if UNAVAILABLE_CLASS.match(line[:200])]
+                if named:
+                    raise ReadFailed(named[-1])
             raise ReadFailed(f"ADMISSION_COMMAND_UNAVAILABLE:{done.returncode}")
         consumed = _read_basis(reads, head, base)
         if done.returncode == 0:

@@ -1,11 +1,12 @@
-"""A bounded admission round reads at most round_reads candidates, longest-waiting first, then ends.
+"""A bounded admission round starts at most round_reads candidates, longest-waiting first, and refills freed slots.
 
 A round's candidates are fixed when it starts. With a long backlog and few admission lanes one round can run for
 hours, and a pull request opened (or declared urgent) meanwhile waits for the next. With [admission] round_reads a
-round reads at most that many candidates and ends, so the next round lists again within minutes. The order is the
+round starts at most that many candidates and, as each read finishes, lists again and starts the next from the
+current queue, so a slow read never idles the other slots and a new head is not left to the next round. The order is the
 declared priority first, then whoever has waited longest. A candidate starts waiting when it is first seen and again
 each time it is read, and a tie goes to the older pull request, so a steady stream of new heads never starves an old
-one. The rest of the backlog is recorded as deferred.
+one. What a round leaves unread when it ends is recorded as deferred.
 """
 
 from __future__ import annotations
@@ -48,24 +49,24 @@ class Rounds:
 
 
 class RoundReads(unittest.TestCase):
-    def test_a_bounded_round_reads_the_oldest_first_and_defers_the_rest(self):
+    def test_a_bounded_round_reads_the_oldest_first_and_refills_the_rest(self):
         rounds = Rounds([51, 52, 53, 54], admission_round_reads=2)
         read, out = rounds.tick()
-        self.assertEqual(read, [51, 52])
-        self.assertEqual(out["deferred"], [53, 54])
+        self.assertEqual(read, [51, 52, 54, 53])
+        self.assertNotIn("deferred", out)
 
-    def test_the_next_round_reads_the_deferred_before_a_newer_arrival(self):
+    def test_the_next_round_reads_only_the_newer_arrival(self):
         rounds = Rounds([51, 52, 53, 54], admission_round_reads=2)
         rounds.tick()
         _open(rounds.repo, 55)
         read, out = rounds.tick()
-        self.assertEqual(read, [53, 54])
-        self.assertEqual(out["deferred"], [55])
+        self.assertEqual(read, [55])
+        self.assertNotIn("deferred", out)
 
     def test_declared_priority_leads_a_bounded_round(self):
         rounds = Rounds([51, 52, 53, 54], admission_round_reads=2, admission_priority_command="echo 54")
         read, _ = rounds.tick()
-        self.assertEqual(read, [54, 51])
+        self.assertEqual(read, [54, 51, 53, 52])
 
     def test_without_round_reads_every_candidate_is_read(self):
         rounds = Rounds([51, 52, 53, 54])

@@ -266,6 +266,7 @@ Unknown keys are refused.
 | `train.rate_floor` | `200` | pause while GitHub's remaining budget is below this |
 | `train.comment` | `true` | comment on merged pull requests |
 | `train.interval_seconds` | `300` | sleep between rounds in `watch` |
+| `train.tick_seconds` | unset | end a tick after this long; admission reads still running carry into the next tick of the same process (`watch`). Unset: a tick waits for all its reads |
 | `labels.hold` | `"train:hold"` | label that keeps a pull request out |
 | `repair.enabled` | `true` | push mechanical fixes (union merges, stale base) to pull-request branches |
 | `repair.union_merge` | `[]` | globs of files merged by git's union merge (`merge=union`) instead of conflicting |

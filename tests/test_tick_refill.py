@@ -117,3 +117,58 @@ def test_tick_seconds_is_a_positive_number_or_unset():
     for bad in (0, -1, '5', True):
         with pytest.raises(ConfigError):
             from_dict({**base, 'train': {'tick_seconds': bad}})
+
+
+class Declared:
+    """Declared head `fail` raises a read failure; head `after` waits until it has failed; the rest answer at once."""
+
+    def __init__(self, fail='h1', after='h2'):
+        self.fail, self.after, self.failed = fail, after, threading.Event()
+        self.calls, self.lock = [], threading.Lock()
+
+    def __call__(self, head, base):
+        from svrf.errors import ReadFailed
+        with self.lock:
+            self.calls.append(head)
+        if head == self.fail:
+            self.failed.set()
+            raise ReadFailed('GH_UNAVAILABLE')
+        if head == self.after:
+            assert self.failed.wait(10)
+            time.sleep(0.05)
+        return {'verdict': 'MERGEABLE', 'residuals': []}
+
+
+def test_refill_does_not_take_undeclared_heads_while_a_declared_read_failed(tmp_path):
+    repo = DaemonRepo([1, 2, 3, 4, 5, 6, 7, 8])
+    gh, gate, admission = DaemonGitHub(repo), FakeGate(repo), Declared()
+    owner = daemon(repo, gh, gate, admission, tmp_path, jobs=2, admission_jobs=2, admission_round_reads=2,
+                   admission_priority_command="printf '1\\n2\\n'")
+    result = owner.tick()
+    assert sorted(admission.calls) == ['h1', 'h2']
+    assert result['retry_later'] == [1]
+    assert result['refill_stopped'] == {'declared_unread': [1]}
+    assert result['inflight'] == []
+    assert gh.merged == [2]
+
+
+def test_refill_takes_a_declared_unread_head_ahead_of_undeclared_ones(tmp_path):
+    repo = DaemonRepo([1, 2, 3, 4, 5, 6, 7, 8])
+    gh, gate, admission = DaemonGitHub(repo), FakeGate(repo), Declared()
+    owner = daemon(repo, gh, gate, admission, tmp_path, jobs=2, admission_jobs=2, admission_round_reads=2,
+                   admission_priority_command="printf '1\\n2\\n3\\n'")
+    result = owner.tick()
+    assert sorted(admission.calls) == ['h1', 'h2', 'h3']
+    assert result['refill_stopped'] == {'declared_unread': [1]}
+    assert sorted(gh.merged) == [2, 3]
+
+
+def test_an_unreadable_priority_command_leaves_refill_unchanged(tmp_path):
+    repo = DaemonRepo([1, 2, 3, 4, 5, 6, 7, 8])
+    gh, gate, admission = DaemonGitHub(repo), FakeGate(repo), Declared()
+    owner = daemon(repo, gh, gate, admission, tmp_path, jobs=2, admission_jobs=2, admission_round_reads=2,
+                   admission_priority_command='exit 4')
+    result = owner.tick()
+    assert 'refill_stopped' not in result
+    assert len(admission.calls) == 8
+    assert sorted(gh.merged) == [2, 3, 4, 5, 6, 7, 8]

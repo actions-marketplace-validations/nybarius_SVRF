@@ -113,7 +113,7 @@ class Admission:
         self.refactor_prefixes, self.command, self.timeout = refactor_prefixes, command, timeout
         self.pool = SlotPool(Path(pool), slots) if pool is not None else None
 
-    def __call__(self, head: str, base: str) -> dict:
+    def __call__(self, head: str, base: str, pr: int | None = None) -> dict:
         if self.git.is_ancestor(head, base):
             return {"verdict": "LANDED", "residuals": [], "changed": []}
         residuals: list[str] = []
@@ -128,19 +128,19 @@ class Admission:
                 residuals.append(f"history:{result}")
         consumed = None
         if self.command:
-            lines, consumed = self._command(head, base)
+            lines, consumed = self._command(head, base, pr)
             residuals += lines
         value = {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
         if consumed is not None:
             value["consumed"] = consumed
         return value
 
-    def _command(self, head: str, base: str) -> tuple[list[str], list[dict] | None]:
+    def _command(self, head: str, base: str, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         if self.pool is None:
-            return self._run_command(head, base, self.git.root)
+            return self._run_command(head, base, self.git.root, pr)
         slot = self.pool.acquire()
         try:
-            return self._run_command(head, base, self._slot_root(slot))
+            return self._run_command(head, base, self._slot_root(slot), pr)
         finally:
             self.pool.release(slot)
 
@@ -155,14 +155,16 @@ class Admission:
                             str(slot), "HEAD"], check=True, capture_output=True)
         return slot
 
-    def _run_command(self, head: str, base: str, root: Path) -> tuple[list[str], list[dict] | None]:
+    def _run_command(self, head: str, base: str, root: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         with tempfile.TemporaryDirectory(prefix="svrf-admission-reads-") as scratch:
-            return self._execute_command(head, base, root, Path(scratch) / "reads.json")
+            return self._execute_command(head, base, root, Path(scratch) / "reads.json", pr)
 
     def _execute_command(self, head: str, base: str, root: Path,
-                         reads: Path) -> tuple[list[str], list[dict] | None]:
+                         reads: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
                "SVRF_ADMISSION_READS": str(reads)}
+        if pr is not None:
+            env["SVRF_PR"] = str(pr)
         # The command runs in its own session: a timeout kills the whole process group (bash and
         # the uv/python/pytest children it started), never bash alone with its children left
         # running on the host to slow every later read into the same timeout.

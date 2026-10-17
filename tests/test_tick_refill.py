@@ -107,3 +107,13 @@ def test_a_running_admission_crosses_the_tick_boundary_once_with_its_receipts(tm
     assert [r['requested'] for r in receipts(first) + receipts(second) + receipts(third)] == [[2], [3], [1]]
     assert all(m['identity'] for r in receipts(third) for m in r['merges'])
 
+
+def test_tick_seconds_is_a_positive_number_or_unset():
+    import pytest
+    from svrf.config import ConfigError, from_dict
+    base = {'repo': 'example/project', 'gate': {'commands': ['make test']}}
+    assert from_dict(base).train.tick_seconds is None
+    assert from_dict({**base, 'train': {'tick_seconds': 240}}).train.tick_seconds == 240
+    for bad in (0, -1, '5', True):
+        with pytest.raises(ConfigError):
+            from_dict({**base, 'train': {'tick_seconds': bad}})

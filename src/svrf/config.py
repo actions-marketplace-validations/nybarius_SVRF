@@ -41,6 +41,7 @@ class TrainConfig:
     rate_floor: int = 200
     comment: bool = True
     interval_seconds: float = 300
+    tick_seconds: float | None = None  # a tick ends after this long; reads still running carry into the next (watch)
 
 
 @dataclass
@@ -198,6 +199,9 @@ def from_dict(value: dict, *, root: Path | None = None) -> Config:
     if isinstance(config.train.family_cap, bool) or not isinstance(config.train.family_cap, int) \
             or config.train.family_cap < 1:
         raise ConfigError("train.family_cap must be a whole number of at least 1")
+    tick = config.train.tick_seconds
+    if tick is not None and (isinstance(tick, bool) or not isinstance(tick, (int, float)) or tick <= 0):
+        raise ConfigError("train.tick_seconds must be a positive number of seconds")
     timeout = config.merge.tree_timeout_seconds
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ConfigError("[merge] tree_timeout_seconds must be a positive number of seconds")

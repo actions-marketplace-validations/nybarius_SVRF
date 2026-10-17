@@ -486,6 +486,15 @@ class Daemon:
                     summary.pop("deferred", None)
                     more = self._discover(requested, changed, state, summary, skip=set(self.inflight), seen=seen,
                                           refill=True)
+                    # a declared head whose read failed this tick is not read again until the next tick lists: until
+                    # then no undeclared head is taken, so the declared lead the next tick instead of a whole backlog
+                    declared = (summary.get("admission_priority") or {}).get("read") or []
+                    unread = [n for n in declared if n in seen and n in summary["retry_later"]]
+                    if unread:
+                        more = [r for r in more or [] if int(r["number"]) in declared]
+                        summary["refill_stopped"] = {"declared_unread": unread}
+                        if not more:
+                            summary.pop("deferred", None)
                     if more:
                         try:
                             more_base = self._stage(more)

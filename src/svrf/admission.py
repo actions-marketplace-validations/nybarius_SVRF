@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,11 @@ from .locks import SlotPool
 from .redact import redact
 
 UNAVAILABLE_EXITS = (126, 127)
+# The projected reason a command names on its output before exiting 126: an unobserved IO charge, a full IO
+# pool, a budgeted intake that yielded part-way, or an output it could not observe. Each is a read not made
+# (retry_later), never a verdict.
+UNAVAILABLE_CLASS = re.compile(
+    r"^(IO_CHARGE_UNOBSERVED:\S+|IO_POOL_CAPACITY|INTAKE_BUDGET_YIELD:\d+/\d+|INTAKE_OUTPUT_UNOBSERVED:\S+)$")
 
 
 def _unique(pairs):
@@ -107,7 +113,7 @@ class Admission:
         self.refactor_prefixes, self.command, self.timeout = refactor_prefixes, command, timeout
         self.pool = SlotPool(Path(pool), slots) if pool is not None else None
 
-    def __call__(self, head: str, base: str) -> dict:
+    def __call__(self, head: str, base: str, pr: int | None = None) -> dict:
         if self.git.is_ancestor(head, base):
             return {"verdict": "LANDED", "residuals": [], "changed": []}
         residuals: list[str] = []
@@ -122,19 +128,19 @@ class Admission:
                 residuals.append(f"history:{result}")
         consumed = None
         if self.command:
-            lines, consumed = self._command(head, base)
+            lines, consumed = self._command(head, base, pr)
             residuals += lines
         value = {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
         if consumed is not None:
             value["consumed"] = consumed
         return value
 
-    def _command(self, head: str, base: str) -> tuple[list[str], list[dict] | None]:
+    def _command(self, head: str, base: str, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         if self.pool is None:
-            return self._run_command(head, base, self.git.root)
+            return self._run_command(head, base, self.git.root, pr)
         slot = self.pool.acquire()
         try:
-            return self._run_command(head, base, self._slot_root(slot))
+            return self._run_command(head, base, self._slot_root(slot), pr)
         finally:
             self.pool.release(slot)
 
@@ -149,14 +155,16 @@ class Admission:
                             str(slot), "HEAD"], check=True, capture_output=True)
         return slot
 
-    def _run_command(self, head: str, base: str, root: Path) -> tuple[list[str], list[dict] | None]:
+    def _run_command(self, head: str, base: str, root: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         with tempfile.TemporaryDirectory(prefix="svrf-admission-reads-") as scratch:
-            return self._execute_command(head, base, root, Path(scratch) / "reads.json")
+            return self._execute_command(head, base, root, Path(scratch) / "reads.json", pr)
 
     def _execute_command(self, head: str, base: str, root: Path,
-                         reads: Path) -> tuple[list[str], list[dict] | None]:
+                         reads: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
                "SVRF_ADMISSION_READS": str(reads)}
+        if pr is not None:
+            env["SVRF_PR"] = str(pr)
         # The command runs in its own session: a timeout kills the whole process group (bash and
         # the uv/python/pytest children it started), never bash alone with its children left
         # running on the host to slow every later read into the same timeout.
@@ -169,6 +177,11 @@ class Admission:
             raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
+            if done.returncode == 126:
+                named = [line[:200] for line in (ln.strip() for ln in redact(done.stdout + done.stderr, env).splitlines())
+                         if UNAVAILABLE_CLASS.match(line[:200])]
+                if named:
+                    raise ReadFailed(named[-1])
             raise ReadFailed(f"ADMISSION_COMMAND_UNAVAILABLE:{done.returncode}")
         consumed = _read_basis(reads, head, base)
         if done.returncode == 0:

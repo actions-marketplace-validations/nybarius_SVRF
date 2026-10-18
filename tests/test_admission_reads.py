@@ -97,3 +97,31 @@ print('original refusal')
             rows = list(pool.map(lambda head: owner(head, 'c0'), ['left', 'right']))
         self.assertEqual([r.get('consumed') for r in rows],
                          [[{'kind': 'PATH', 'id': 'left'}], [{'kind': 'PATH', 'id': 'right'}]])
+
+
+class CommandPr(unittest.TestCase):
+    """The admission command reads the candidate's PR number from SVRF_PR."""
+
+    def test_daemon_read_exports_the_rows_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = DaemonRepo([31])
+            repo.root = Path(tmp)
+            repo.merge_preview = lambda *a: {"status": "CLEAN", "conflicts": []}
+            repo.changed_paths = lambda *a: []
+            code = "import os; print('pr=' + os.environ.get('SVRF_PR', 'ABSENT')); raise SystemExit(1)"
+            command = shlex.quote(sys.executable) + " -c " + shlex.quote(code)
+            owner = daemon(repo, DaemonGitHub(repo), FakeGate(repo), Admission(repo, command=command), Path(tmp))
+            value, failure = owner._read_admission({"number": 31, "headRefOid": "h31"}, "c0")
+            self.assertIsNone(failure)
+            self.assertEqual(value["residuals"], ["check:pr=31"])
+
+    def test_pr_is_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = DaemonRepo([31])
+            repo.root = Path(tmp)
+            repo.merge_preview = lambda *a: {"status": "CLEAN", "conflicts": []}
+            repo.changed_paths = lambda *a: []
+            code = "import os; print('pr=' + os.environ.get('SVRF_PR', 'ABSENT')); raise SystemExit(1)"
+            command = shlex.quote(sys.executable) + " -c " + shlex.quote(code)
+            answer = Admission(repo, command=command)('h31', 'c0')
+            self.assertEqual(answer["residuals"], ["check:pr=ABSENT"])

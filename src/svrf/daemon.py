@@ -195,13 +195,24 @@ class Daemon:
             return None, "NOT_A_NUMBER"
         return [int(line) for line in lines], None
 
-    def tick(self) -> dict:
+    def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
             if not owned:
                 return {"tick": "LOCKED", "at": _stamp(self.clock)}
+            if drain:
+                # Receive the futures with their original inputs without asking
+                # a driver or discovery to admit another candidate.
+                return self._tick(requested=set())
             if self.demand is not None:
                 return self.demand.drain(self)
             return self._tick()
+
+    def close(self) -> None:
+        """Retire an idle owner; a running admission must first be received."""
+        if self.inflight:
+            raise RuntimeError("ADMISSIONS_STILL_RUNNING")
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
 
     def _retry(self, summary: dict, n: int, reason: str) -> None:
         if n not in summary["retry_later"]:

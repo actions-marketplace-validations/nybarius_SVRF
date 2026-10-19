@@ -25,6 +25,7 @@ import argparse
 import dataclasses
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,49 @@ def _numbers(text: str) -> list[int]:
 
 def _print(value) -> None:
     print(json.dumps(value, indent=1, sort_keys=True, default=str), flush=True)
+
+
+def _watch(daemon, config, *, path, interval=None, dry_run=False) -> int:
+    """Reobserve configuration between ticks; retire an owner only after its work drains."""
+    stopping, retired = False, False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        while True:
+            if stopping and not daemon.inflight:
+                daemon.close()
+                return 0
+            desired = None
+            if not stopping:
+                try:
+                    desired = load(path)
+                except (OSError, ConfigError, ValueError) as error:
+                    _print({"tick": "RETRY", "reason": f"CONFIG_UNOBSERVED:{error}"})
+            changed = desired is None or desired != config or retired
+            if changed and not daemon.inflight and desired is not None:
+                try:
+                    ensure_clone(desired)
+                    daemon.close()
+                    retired = True
+                    successor = build(desired, dry_run=dry_run)
+                except (OSError, ConfigError, ReadFailed, ValueError) as error:
+                    _print({"tick": "RETRY", "reason": f"CONFIG_RELOAD_UNOBSERVED:{error}"})
+                else:
+                    daemon, config, retired, changed = successor, desired, False, False
+                    _print({"tick": "RECONFIGURED", "repo": config.repo, "base": config.base})
+            if not changed or daemon.inflight:
+                _print(daemon.tick(drain=changed or stopping))
+            if stopping and not daemon.inflight:
+                daemon.close()
+                return 0
+            time.sleep(interval or config.train.interval_seconds)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def status(config) -> dict:
@@ -282,15 +326,11 @@ def main(argv: list[str] | None = None, *, github=None) -> int:
                 "retry_later": [u["number"] for u in receipt["retry_later"]], "alerts": receipt["alerts"],
                 "gates": len(receipt["gates"])})
         return 1 if any(a["alert"] == "TREE_MISMATCH" for a in receipt["alerts"]) else 0
-    interval = getattr(args, "interval", None) or config.train.interval_seconds
-    while True:
-        summary = daemon.tick()
-        _print(summary)
-        if summary.get("tick") == "LOCKED" and args.command != "watch":
-            return 3
-        if args.command != "watch":
-            return 0
-        time.sleep(interval)
+    if args.command == "watch":
+        return _watch(daemon, config, path=args.config, interval=args.interval, dry_run=dry_run)
+    summary = daemon.tick()
+    _print(summary)
+    return 3 if summary.get("tick") == "LOCKED" else 0
 
 
 if __name__ == "__main__":

@@ -404,6 +404,8 @@ class Daemon:
 
     def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
         """Leave unstarted heads for discovery at their current source and priority."""
+        if self.tick_seconds is None and self.admission_round_reads is None:
+            return rows  # the original one-shot mode owns one complete snapshot
         free = max(0, slots - len(self.inflight))
         if len(rows) > free:
             summary["deferred"] = list(dict.fromkeys(

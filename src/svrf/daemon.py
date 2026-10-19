@@ -402,6 +402,16 @@ class Daemon:
             self.inflight[n] = {"future": self._pool.submit(self._timed_read, row, base), "row": row, "base": base,
                                 "inputs": self.round_inputs.get(n)}
 
+    def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
+        """Leave unstarted heads for discovery at their current source and priority."""
+        if self.tick_seconds is None and self.admission_round_reads is None:
+            return rows  # the original one-shot mode owns one complete snapshot
+        free = max(0, slots - len(self.inflight))
+        if len(rows) > free:
+            summary["deferred"] = list(dict.fromkeys(
+                [int(r["number"]) for r in rows[free:]] + summary.get("deferred", [])))
+        return rows[:free]
+
     def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
         summary = self._tick_body(requested, changed)
         if summary.get("tick") == "RAN" and not self.dry_run:
@@ -443,12 +453,6 @@ class Daemon:
         slots = self.admission_jobs
         base = None
         if candidates:
-            try:
-                base = self._stage(candidates)
-            except ReadFailed as failure:
-                summary.update(tick="RETRY", reason=failure.reason)
-                self.save(state, summary)
-                return summary
             if self.admission_capacity_command:
                 capacity, unread = self._admission_capacity()
                 if capacity is None or capacity == 0:
@@ -460,6 +464,7 @@ class Daemon:
                     for row in candidates:
                         self._retry(summary, int(row["number"]), reason)
                     candidates = []
+                    slots = 0
                     if not self.inflight:
                         self.save(state, summary)
                         return summary
@@ -470,9 +475,18 @@ class Daemon:
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="admission")
             self._pool_slots = slots
-        slots = self._pool_slots
+        slots = min(slots, self._pool_slots)
+        candidates = self._owned_candidates(candidates, slots, summary)
+        if candidates:
+            try:
+                base = self._stage(candidates)
+            except ReadFailed as failure:
+                summary.update(tick="RETRY", reason=failure.reason)
+                self.save(state, summary)
+                return summary
         admitted: list[int] = []
-        seen = {int(r["number"]): r.get("headRefOid") for r in candidates}
+        seen = {n: item["row"].get("headRefOid") for n, item in self.inflight.items()}
+        seen.update({int(r["number"]): r.get("headRefOid") for r in candidates})
         known: dict[int, dict] = {}
         deadline = started + self.tick_seconds if self.tick_seconds else None
         try:
@@ -545,6 +559,7 @@ class Daemon:
                         if not more:
                             summary.pop("deferred", None)
                     if more:
+                        more = self._owned_candidates(more, slots, summary)
                         try:
                             more_base = self._stage(more)
                         except ReadFailed:

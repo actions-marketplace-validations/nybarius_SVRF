@@ -16,6 +16,7 @@ def test_drain_keeps_the_original_future_and_does_not_admit_a_new_head(tmp_path)
                    admission_jobs=2, tick_seconds=0.05)
     try:
         assert owner.tick()['inflight'] == [1]
+        pool = owner._pool
         with pytest.raises(RuntimeError, match='ADMISSIONS_STILL_RUNNING'):
             owner.close()
         repo.commits['h2'] = {'lanes': frozenset({0, 2}), 'parents': ('c0',)}
@@ -27,7 +28,7 @@ def test_drain_keeps_the_original_future_and_does_not_admit_a_new_head(tmp_path)
         assert result['inflight'] == [] and gh.merged == [1]
         assert admission.calls == ['h1']
         owner.close()
-        assert owner._pool._shutdown
+        assert pool._shutdown
         # A fresh owner rediscovers the still-pending head from ordinary state.
         resumed = daemon(repo, gh, FakeGate(repo), admission, tmp_path)
         assert resumed.tick()['merged'] == [2]

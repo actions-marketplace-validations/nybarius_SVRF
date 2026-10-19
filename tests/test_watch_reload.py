@@ -1,6 +1,7 @@
 """A changed watch configuration drains original admissions before replacing their owner."""
 import json
 import signal
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +29,7 @@ def test_drain_keeps_the_original_future_and_does_not_admit_a_new_head(tmp_path)
         result = owner.tick(drain=True)
         assert result['inflight'] == [] and gh.merged == []
         assert admission.calls == ['h1']
-        received = json.loads(next((tmp_path / 'receipts').glob('drain-*.json')).read_text())
+        received = json.loads(Path(result['receipt']).read_text())
         assert received['drained'][0]['head'] == 'h1'
         assert received['drained'][0]['base'] == 'c0'
         assert received['drained'][0]['admission'] == {'verdict': 'MERGEABLE', 'residuals': []}

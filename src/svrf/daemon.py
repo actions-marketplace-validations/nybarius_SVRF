@@ -200,9 +200,7 @@ class Daemon:
             if not owned:
                 return {"tick": "LOCKED", "at": _stamp(self.clock)}
             if drain:
-                # Receive the futures with their original inputs without asking
-                # a driver or discovery to admit another candidate.
-                return self._tick(requested=set())
+                return self._drain()
             if self.demand is not None:
                 return self.demand.drain(self)
             return self._tick()
@@ -213,6 +211,43 @@ class Daemon:
             raise RuntimeError("ADMISSIONS_STILL_RUNNING")
         if self._pool is not None:
             self._pool.shutdown(wait=True)
+
+    def _drain(self) -> dict:
+        """Retain completed reads without starting effects under a replaced configuration.
+
+        Open pull requests remain pending for the next owner's ordinary discovery
+        and gate. The admission reader can reuse its own unchanged checked work.
+        """
+        started = time.monotonic()
+        pending = sorted(self.inflight)
+        self.round_inputs = {n: item['inputs'] for n, item in self.inflight.items() if item.get('inputs')}
+        ready = set()
+        if self.inflight:
+            ready, _ = wait([item['future'] for item in self.inflight.values()],
+                            timeout=self.tick_seconds, return_when=FIRST_COMPLETED)
+        completed = []
+        for number, item in list(self.inflight.items()):
+            if item['future'] not in ready:
+                continue
+            value, failure, seconds = item['future'].result()
+            completed.append({'number': number, 'head': item['row'].get('headRefOid'),
+                              'base': item['base'], 'inputs': item.get('inputs'), 'admission': value,
+                              'failure': None if failure is None else {
+                                  'type': type(failure).__name__, 'reason': str(failure)},
+                              'seconds': seconds})
+        summary = {'tick': 'DRAINED', 'at': _stamp(self.clock), 'admitted': [], 'held': [], 'merged': [],
+                   'deferred': pending, 'inflight': sorted(set(pending) - {r['number'] for r in completed}),
+                   'admission_seconds': {str(r['number']): r['seconds'] for r in completed},
+                   'wall_seconds': time.monotonic() - started, 'receipts': [], 'receipt': None}
+        if completed and not self.dry_run:
+            stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(self.clock()))
+            path = self.receipts / f'drain-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json'
+            self._write(path, {'schema_version': 'svrf.drain/1', **summary, 'drained': completed})
+            summary.update(receipt=str(path), receipts=[str(path)])
+        for row in completed:
+            self.inflight.pop(row['number'])
+        self.save(self.load_state(), summary)
+        return summary
 
     def _retry(self, summary: dict, n: int, reason: str) -> None:
         if n not in summary["retry_later"]:

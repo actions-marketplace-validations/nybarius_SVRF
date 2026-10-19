@@ -1,4 +1,5 @@
 """A changed watch configuration drains original admissions before replacing their owner."""
+import json
 import signal
 
 import pytest
@@ -25,14 +26,20 @@ def test_drain_keeps_the_original_future_and_does_not_admit_a_new_head(tmp_path)
         assert admission.calls == ['h1']
         admission.release.set()
         result = owner.tick(drain=True)
-        assert result['inflight'] == [] and gh.merged == [1]
+        assert result['inflight'] == [] and gh.merged == []
         assert admission.calls == ['h1']
+        received = json.loads(next((tmp_path / 'receipts').glob('drain-*.json')).read_text())
+        assert received['drained'][0]['head'] == 'h1'
+        assert received['drained'][0]['base'] == 'c0'
+        assert received['drained'][0]['admission'] == {'verdict': 'MERGEABLE', 'residuals': []}
         owner.close()
         assert pool._shutdown
-        # A fresh owner rediscovers the still-pending head from ordinary state.
-        resumed = daemon(repo, gh, FakeGate(repo), admission, tmp_path)
+        # The new gate must read the pending original head too. Its old read
+        # cannot launch a merge under the replaced configuration.
+        resumed = daemon(repo, gh, FakeGate(repo, bad=[1]), admission, tmp_path)
         assert resumed.tick()['merged'] == [2]
-        assert gh.merged == [1, 2]
+        assert gh.merged == [2]
+        assert admission.calls.count('h1') == 2
         resumed.close()
     finally:
         admission.release.set()

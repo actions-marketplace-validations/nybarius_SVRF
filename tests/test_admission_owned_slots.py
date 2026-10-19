@@ -1,6 +1,7 @@
 """Queued futures own an admission too: leave excess heads for current discovery."""
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,12 @@ class OwnedSlots(unittest.TestCase):
         self.repo.heads[number] = sha
         self.repo.branches[f'pr-{number}'] = sha
 
+    def receive_until(self, number):
+        deadline = time.monotonic() + 10
+        while number not in self.gh.merged and time.monotonic() < deadline:
+            self.owner.tick()
+        self.assertIn(number, self.gh.merged)
+
     def test_discovery_ticks_do_not_reserve_a_hidden_queue_behind_owned_slots(self):
         first = self.owner.tick()
         self.assertEqual(first['inflight'], [1, 2])
@@ -55,7 +62,7 @@ class OwnedSlots(unittest.TestCase):
         self.owner.tick()
         self.open_head(99, 'h99')
         self.release.set()
-        self.owner.tick()
+        self.receive_until(99)
         self.assertIn('h99', self.calls)
         self.assertEqual(self.calls[2], 'h99')
         self.assertIn(99, self.gh.merged)
@@ -64,8 +71,7 @@ class OwnedSlots(unittest.TestCase):
         self.owner.tick()
         self.open_head(3, 'h3-changed')
         self.release.set()
-        while 3 not in self.gh.merged:
-            self.owner.tick()
+        self.receive_until(3)
         self.assertNotIn('h3', self.calls)
         self.assertIn('h3-changed', self.calls)
 

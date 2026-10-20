@@ -494,7 +494,8 @@ class Daemon:
                 self.save(state, summary)
                 return summary
         admitted: list[int] = []
-        seen = {n: item["row"].get("headRefOid") for n, item in self.inflight.items()}
+        seen = {n: item.get("reland", {}).get("row", item["row"]).get("headRefOid")
+                for n, item in self.inflight.items()}
         seen.update({int(r["number"]): r.get("headRefOid") for r in candidates})
         known: dict[int, dict] = {}
         deadline = started + self.tick_seconds if self.tick_seconds else None
@@ -518,6 +519,13 @@ class Daemon:
                     summary["admission_seconds"][str(n)] = round(seconds, 3)
                     if self.admission_round_reads:
                         state.setdefault("waiting_since", {})[str(n)] = self.clock()
+                    if "reland" in item:
+                        if summary["stopped"]:
+                            self._retry(summary, n, "TRAIN_STOPPED")
+                        else:
+                            self._finish_reland(item["reland"], row["headRefOid"], rbase,
+                                                value, failure, state, summary, revalidate=True)
+                        continue
                     if failure is not None:
                         if isinstance(failure, ReadFailed):
                             self._retry(summary, n, failure.reason)
@@ -928,7 +936,51 @@ class Daemon:
         # that refused the original. In particular, an external command can use
         # a stricter classifier than history_verdict. Check before any push or
         # PR effect; an identical tree alone says nothing about this read.
-        value, error = self._read_admission({**row, "headRefOid": final}, base_sha)
+        original = {"row": dict(row), "class": cls, "tree": step.tree, "ref": ordered_ref,
+                    "inputs": self.round_inputs.get(n)}
+        candidate = {**row, "headRefOid": final}
+        if self.tick_seconds is not None or self.admission_round_reads is not None:
+            # The original future has been received: its replacement owns the
+            # same PR slot and executor while the controller receives other heads.
+            self.round_inputs[n] = {"row": candidate, "admission_base": base_sha, "reland": original}
+            self._submit([candidate], base_sha)
+            self.inflight[n]["reland"] = original
+            return
+        value, error = self._read_admission(candidate, base_sha)
+        self._finish_reland(original, final, base_sha, value, error, state, summary)
+
+    def _reland_source(self, row: dict) -> str | None:
+        """A delayed successor is publishable only for the still-ready original source."""
+        try:
+            current = self.gh.pull(int(row["number"]))
+        except ReadFailed as failure:
+            return f"RELAND:SOURCE_UNOBSERVED:{failure.reason}"
+        except (KeyError, TypeError, ValueError):
+            return "RELAND:SOURCE_UNOBSERVED"
+        if not isinstance(current, dict):
+            return "RELAND:SOURCE_UNOBSERVED"
+        labels = current.get("labels")
+        if (any(type(current.get(key)) is not str or not current[key]
+                for key in ("head_sha", "head_ref", "base_ref", "state"))
+                or type(current.get("draft")) is not bool
+                or type(labels) is not list
+                or any(type(label) is not dict or type(label.get("name")) is not str for label in labels)):
+            return "RELAND:SOURCE_UNOBSERVED"
+        if (current["head_sha"] != row.get("headRefOid")
+                or current["head_ref"] != row.get("headRefName") or current["base_ref"] != self.base):
+            return "RELAND:SOURCE_CHANGED"
+        if (current["state"] != "open" or current["draft"] is not False
+                or any(label["name"] == self.hold_label for label in labels)):
+            return "RELAND:SOURCE_NOT_READY"
+        return None
+
+    def _finish_reland(self, original: dict, final: str, base_sha: str, value, error,
+                       state: dict, summary: dict, *, revalidate: bool = False) -> None:
+        """Receive the original reader's result before any successor publication."""
+        row, cls = original["row"], original["class"]
+        n = int(row["number"])
+        head, ref, title = row.get("headRefOid"), row.get("headRefName"), row.get("title", "")
+        ordered_ref = original["ref"]
         if error is not None:
             reason = error.reason if isinstance(error, ReadFailed) else f"ADMISSION_FAILED:{type(error).__name__}"
             self._retry(summary, n, f"RELAND:{reason}")
@@ -937,7 +989,7 @@ class Daemon:
             self._retry(summary, n, "RELAND:ADMISSION_UNOBSERVED")
             return
         summary.setdefault("repair_checks", []).append({
-            "number": n, "base": base_sha, "head": final, "tree": step.tree,
+            "number": n, "base": base_sha, "head": final, "tree": original["tree"],
             "admission": value})
         residuals = list(value.get("residuals") or [])
         if value.get("verdict") == "HELD" and residuals:
@@ -949,6 +1001,11 @@ class Daemon:
                 or (value.get("admission") or {}).get("complete", True) is not True):
             self._retry(summary, n, "RELAND:ADMISSION_UNOBSERVED")
             return
+        if revalidate:
+            withheld = self._reland_source(row)
+            if withheld:
+                self._retry(summary, n, withheld)
+                return
         try:
             self.git.push_branch(final, ordered_ref)
         except ReadFailed as failure:

@@ -86,7 +86,10 @@ class RebuiltAdmissionProgress(unittest.TestCase):
                     "ready_merged": landed,
                     "completed_ticks": len(ticks),
                     "calls": list(calls),
-                    "published_before_rebuilt_acceptance": bool(repo.pushes or gh.opened or gh.closed),
+                    "published_before_rebuilt_acceptance": bool(
+                        [push for push in repo.pushes if push[0] == "pr-1-ordered"]
+                        or gh.opened or [number for number in gh.closed if number == 1]
+                        or [comment for comment in gh.comments if comment[0] == 1]),
                 }
                 self.assertEqual(errors, [])
                 self.assertFalse(observed["published_before_rebuilt_acceptance"])

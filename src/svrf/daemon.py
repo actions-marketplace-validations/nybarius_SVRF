@@ -32,6 +32,8 @@ A round:
 
 from __future__ import annotations
 
+import itertools
+import os
 import subprocess
 import json
 import math
@@ -41,10 +43,12 @@ from pathlib import Path
 from typing import Callable
 
 from . import rules
+from .admission import Admission
 from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
 from .train import Train
 
+_tick_serial = itertools.count()
 STATE_SCHEMA = "svrf.state/1"
 HELD_SCHEMA = "svrf.held/1"
 
@@ -70,7 +74,8 @@ class Daemon:
                  kind: Callable[[str], str] | None = None, history_verdict: Callable[[str, str], str] | None = None,
                  admission_watch: list[str] | None = None, jobs: int = 1, memory=None, demand=None,
                  admission_jobs: int | None = None, admission_capacity_command: str | None = None,
-                 admission_priority_command: str | None = None, admission_round_reads: int | None = None):
+                 admission_priority_command: str | None = None, admission_round_reads: int | None = None,
+                 tick_seconds: float | None = None):
         self.git, self.gh, self.gate, self.admission = git, github, gate, admission
         self.state_dir = Path(state_dir).expanduser()
         self.receipts = Path(receipts).expanduser()
@@ -99,6 +104,11 @@ class Daemon:
         self.admission_round_reads = admission_round_reads
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
+        # Admission reads outlive a tick only when `tick_seconds` ends it: the pool and the live reads (number ->
+        # future, row, base) persist, and the next tick's snapshot excludes those heads and collects them when done.
+        self.tick_seconds = tick_seconds
+        self.inflight: dict[int, dict] = {}
+        self._pool, self._pool_slots = None, 1
 
     # ---- memory
 
@@ -129,6 +139,7 @@ class Daemon:
         state["last_tick"] = {k: summary[k] for k in (
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
+            "inflight", "admission_seconds", "wall_seconds",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -184,13 +195,59 @@ class Daemon:
             return None, "NOT_A_NUMBER"
         return [int(line) for line in lines], None
 
-    def tick(self) -> dict:
+    def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
             if not owned:
                 return {"tick": "LOCKED", "at": _stamp(self.clock)}
+            if drain:
+                return self._drain()
             if self.demand is not None:
                 return self.demand.drain(self)
             return self._tick()
+
+    def close(self) -> None:
+        """Retire an idle owner; a running admission must first be received."""
+        if self.inflight:
+            raise RuntimeError("ADMISSIONS_STILL_RUNNING")
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+
+    def _drain(self) -> dict:
+        """Retain completed reads without starting effects under a replaced configuration.
+
+        Open pull requests remain pending for the next owner's ordinary discovery
+        and gate. The admission reader can reuse its own unchanged checked work.
+        """
+        started = time.monotonic()
+        pending = sorted(self.inflight)
+        self.round_inputs = {n: item['inputs'] for n, item in self.inflight.items() if item.get('inputs')}
+        ready = set()
+        if self.inflight:
+            ready, _ = wait([item['future'] for item in self.inflight.values()],
+                            timeout=self.tick_seconds, return_when=FIRST_COMPLETED)
+        completed = []
+        for number, item in list(self.inflight.items()):
+            if item['future'] not in ready:
+                continue
+            value, failure, seconds = item['future'].result()
+            completed.append({'number': number, 'head': item['row'].get('headRefOid'),
+                              'base': item['base'], 'inputs': item.get('inputs'), 'admission': value,
+                              'failure': None if failure is None else {
+                                  'type': type(failure).__name__, 'reason': str(failure)},
+                              'seconds': seconds})
+        summary = {'tick': 'DRAINED', 'at': _stamp(self.clock), 'admitted': [], 'held': [], 'merged': [],
+                   'deferred': pending, 'inflight': sorted(set(pending) - {r['number'] for r in completed}),
+                   'admission_seconds': {str(r['number']): r['seconds'] for r in completed},
+                   'wall_seconds': time.monotonic() - started, 'receipts': [], 'receipt': None}
+        if completed and not self.dry_run:
+            stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(self.clock()))
+            path = self.receipts / f'drain-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json'
+            self._write(path, {'schema_version': 'svrf.drain/1', **summary, 'drained': completed})
+            summary.update(receipt=str(path), receipts=[str(path)])
+        for row in completed:
+            self.inflight.pop(row['number'])
+        self.save(self.load_state(), summary)
+        return summary
 
     def _retry(self, summary: dict, n: int, reason: str) -> None:
         if n not in summary["retry_later"]:
@@ -202,43 +259,45 @@ class Daemon:
         also uses (the admission command can run the same heavy suite), so this and a
         running gate never together exceed the host's reserved memory."""
         head = row.get("headRefOid")
+        # Only the built-in Admission takes the PR number (SVRF_PR); other callables keep (head, base).
+        extra = (row["number"],) if isinstance(self.admission, Admission) and row.get("number") is not None else ()
         try:
             if self.memory is not None:
                 with self.memory.admit():
-                    return self.admission(head, base), None
-            return self.admission(head, base), None
+                    return self.admission(head, base, *extra), None
+            return self.admission(head, base, *extra), None
         except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
             return None, error
 
-    def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
-        self.round_rows, self.round_inputs = {}, {}
-        summary = {"tick": "IDLE", "at": _stamp(self.clock), "admitted": [], "held": [], "held_unchanged": [],
-                   "repaired": [], "would_repair": [], "retargeted": [], "would_retarget": [], "skipped": {},
-                   "retry_later": [], "reasons": {}, "merged": [], "merged_elsewhere": [],
-                   "would_close_merged": [], "held_rows": [], "relanded": [], "would_reland": [], "restacked": [], "would_restack": [],
-                   "out": [],
-                   "receipt": None, "receipts": [], "stopped": False, "dry_run": self.dry_run}
-        state = self.load_state()
+    def _discover(self, requested, changed, state: dict, summary: dict, *, skip=frozenset(), seen=None,
+                  refill: bool = False) -> list[dict] | None:
+        """One pull-request list read and the candidates it yields, in read order. `skip` are heads with a
+        live admission, `seen` the (number -> head) pairs already read this tick. None: the read ended the
+        tick (a refill read that fails just yields nothing: the next tick lists again)."""
         try:
             budget = self.gh.rate_limit()
             low = [(k, v) for k, v in sorted(budget.items()) if int(v.get("remaining", 0)) < self.rate_floor]
             if low:
+                if refill:
+                    return []
                 kind, value = low[0]
                 summary.update(tick="RATE_FLOOR", reason=f"RATE_FLOOR:{kind}:{value.get('remaining')}<{self.rate_floor}")
                 resets = [v.get("reset") for _, v in low if _observed_reset(v.get("reset"))]
                 if resets:
                     summary["retry_at"] = max(resets)
                 self.save(state, summary)
-                return summary
+                return None
             rows = self.gh.snapshot()
         except ReadFailed as failure:
+            if refill:
+                return []
             summary.update(tick="RETRY", reason=failure.reason)
             if isinstance(failure, RateLimited) and _observed_reset(failure.reset):
                 summary["retry_at"] = failure.reset
             self.save(state, summary)
-            return summary
+            return None
         by_number = {int(r["number"]): r for r in rows}
-        self.round_rows = by_number
+        self.round_rows.update(by_number)
         stacked_on = {r.get("baseRefName") for r in rows}
         for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"]):
             for n in [n for n in memory if int(n) not in by_number]:
@@ -256,6 +315,8 @@ class Daemon:
             if requested is not None and n not in requested:
                 continue
             row = by_number[n]
+            if n in skip or (seen is not None and seen.get(n) == row.get("headRefOid")):
+                continue  # a live admission, or a head already read this tick
             self.round_inputs[n] = {"row": dict(row)}
             if (changed or {}).get(n, set()) & {"base", "parent"}:
                 state["bases"].pop(str(n), None)
@@ -272,7 +333,8 @@ class Daemon:
             elif decision == "CANDIDATE":
                 candidates.append(row)
             elif decision == "HELD_UNCHANGED":
-                summary["held_unchanged"].append(n)
+                if n not in summary["held_unchanged"]:
+                    summary["held_unchanged"].append(n)
             elif decision == "NOT_AGAINST_BASE":
                 self.stacked(row, heads, state, summary)
             else:
@@ -310,18 +372,12 @@ class Daemon:
             else:
                 candidates.sort(key=lambda r: (rank.get(int(r["number"]), len(rank)), int(r["number"]) in unread,
                                                -int(r["number"])))
-        if not candidates:
-            self.save(state, summary)
-            return summary
-        summary["tick"] = "RAN"
-        try:
-            self.git.fetch([int(r["number"]) for r in candidates])
-            base = self.git.main_sha()
-        except ReadFailed as failure:
-            summary.update(tick="RETRY", reason=failure.reason)
-            self.save(state, summary)
-            return summary
-        admitted: list[int] = []
+        return candidates
+
+    def _stage(self, candidates: list[dict]) -> str:
+        """Fetch the candidates and bind each to the base and watch digest its admission reads."""
+        self.git.fetch([int(r["number"]) for r in candidates])
+        base = self.git.main_sha()
         watch = None
         if self.admission_watch:
             try:
@@ -333,33 +389,124 @@ class Daemon:
             inputs["admission_base"] = base
             if self.admission_watch:
                 inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
+        return base
+
+    def _timed_read(self, row: dict, base: str):
+        started = time.monotonic()
+        value, failure = self._read_admission(row, base)
+        return value, failure, time.monotonic() - started
+
+    def _submit(self, rows: list[dict], base: str) -> None:
+        for row in rows:
+            n = int(row["number"])
+            self.inflight[n] = {"future": self._pool.submit(self._timed_read, row, base), "row": row, "base": base,
+                                "inputs": self.round_inputs.get(n)}
+
+    def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
+        """Leave unstarted heads for discovery at their current source and priority."""
+        if self.tick_seconds is None and self.admission_round_reads is None:
+            return rows  # the original one-shot mode owns one complete snapshot
+        free = max(0, slots - len(self.inflight))
+        if len(rows) > free:
+            summary["deferred"] = list(dict.fromkeys(
+                [int(r["number"]) for r in rows[free:]] + summary.get("deferred", [])))
+        return rows[:free]
+
+    def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
+        summary = self._tick_body(requested, changed)
+        if summary.get("tick") == "RAN" and not self.dry_run:
+            self._write_tick_receipt(summary)
+        return summary
+
+    def _write_tick_receipt(self, summary: dict) -> None:
+        """What a landings-per-hour and an intake-time read consume: the tick's wall time, each admission's
+        duration, and what it landed."""
+        row = {"schema_version": "svrf.tick/1", "at": summary["at"], "wall_seconds": summary.get("wall_seconds"),
+               "admission_seconds": summary["admission_seconds"], "admitted": summary["admitted"],
+               "merged": summary["merged"], "inflight": summary["inflight"], "receipts": summary["receipts"]}
+        self.receipts.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
+        path = self.receipts / f"tick-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json"
+        self._write(path, row)
+
+    def _tick_body(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
+        started = time.monotonic()
+        self.round_rows, self.round_inputs = {}, {}
+        summary = {"tick": "IDLE", "at": _stamp(self.clock), "admitted": [], "held": [], "held_unchanged": [],
+                   "repaired": [], "would_repair": [], "retargeted": [], "would_retarget": [], "skipped": {},
+                   "retry_later": [], "reasons": {}, "merged": [], "merged_elsewhere": [],
+                   "would_close_merged": [], "held_rows": [], "relanded": [], "would_reland": [], "restacked": [], "would_restack": [],
+                   "out": [],
+                   "receipt": None, "receipts": [], "stopped": False, "dry_run": self.dry_run,
+                   "inflight": [], "admission_seconds": {}, "wall_seconds": None}
+        state = self.load_state()
+        for n, item in self.inflight.items():  # a read carried over from an earlier tick keeps its inputs
+            if item.get("inputs"):
+                self.round_inputs[n] = item["inputs"]
+        candidates = self._discover(requested, changed, state, summary, skip=set(self.inflight))
+        if candidates is None:
+            return summary
+        if not candidates and not self.inflight:
+            self.save(state, summary)
+            return summary
+        summary["tick"] = "RAN"
         slots = self.admission_jobs
-        if self.admission_capacity_command:
-            capacity, unread = self._admission_capacity()
-            if capacity is None or capacity == 0:
-                summary["admission_capacity"] = ({"command": self.admission_capacity_command, "UNOBSERVED": unread}
-                                                 if capacity is None else
-                                                 {"command": self.admission_capacity_command, "value": 0, "slots": 0})
-                reason = f"ADMISSION_CAPACITY_UNOBSERVED:{unread}" if capacity is None else "ADMISSION_CAPACITY:0"
-                for row in candidates:
-                    self._retry(summary, int(row["number"]), reason)
+        base = None
+        if candidates:
+            if self.admission_capacity_command:
+                capacity, unread = self._admission_capacity()
+                if capacity is None or capacity == 0:
+                    summary["admission_capacity"] = ({"command": self.admission_capacity_command, "UNOBSERVED": unread}
+                                                     if capacity is None else
+                                                     {"command": self.admission_capacity_command, "value": 0,
+                                                      "slots": 0})
+                    reason = f"ADMISSION_CAPACITY_UNOBSERVED:{unread}" if capacity is None else "ADMISSION_CAPACITY:0"
+                    for row in candidates:
+                        self._retry(summary, int(row["number"]), reason)
+                    candidates = []
+                    slots = 0
+                    if not self.inflight:
+                        self.save(state, summary)
+                        return summary
+                else:
+                    slots = min(slots, capacity)
+                    summary["admission_capacity"] = {"command": self.admission_capacity_command, "value": capacity,
+                                                     "slots": slots}
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="admission")
+            self._pool_slots = slots
+        slots = min(slots, self._pool_slots)
+        candidates = self._owned_candidates(candidates, slots, summary)
+        if candidates:
+            try:
+                base = self._stage(candidates)
+            except ReadFailed as failure:
+                summary.update(tick="RETRY", reason=failure.reason)
                 self.save(state, summary)
                 return summary
-            slots = min(slots, capacity)
-            summary["admission_capacity"] = {"command": self.admission_capacity_command, "value": capacity,
-                                             "slots": slots}
-        executor = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="admission")
+        admitted: list[int] = []
+        seen = {n: item["row"].get("headRefOid") for n, item in self.inflight.items()}
+        seen.update({int(r["number"]): r.get("headRefOid") for r in candidates})
+        known: dict[int, dict] = {}
+        deadline = started + self.tick_seconds if self.tick_seconds else None
         try:
-            pending = {executor.submit(self._read_admission, row, base): row for row in candidates}
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            self._submit(candidates, base)
+            while self.inflight:
+                pending = {item["future"]: n for n, item in self.inflight.items()}
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                done, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                if not done:
+                    break  # the tick's time is spent: the reads still running cross into the next tick
                 batch: list[int] = []
                 # Keep every result already available in the same group. Slow reads
                 # do not order other heads; the train still owns folding and landing.
-                for future in sorted(done, key=lambda f: int(pending[f]["number"])):
-                    row = pending.pop(future)
-                    n = int(row["number"])
-                    value, failure = future.result()
+                for future in sorted(done, key=lambda f: pending[f]):
+                    n = pending[future]
+                    item = self.inflight.pop(n)
+                    row, rbase = item["row"], item["base"]
+                    known[n] = row
+                    value, failure, seconds = future.result()
+                    summary["admission_seconds"][str(n)] = round(seconds, 3)
                     if self.admission_round_reads:
                         state.setdefault("waiting_since", {})[str(n)] = self.clock()
                     if failure is not None:
@@ -377,27 +524,56 @@ class Daemon:
                     elif summary["stopped"]:
                         self._retry(summary, n, "TRAIN_STOPPED")
                     elif decision == "ALREADY_MERGED":
-                        self.close_merged(row, base, state, summary)
+                        self.close_merged(row, rbase, state, summary)
                     elif decision == "REPAIR" and self.repair_enabled:
                         self.repair(row, cls, residuals, state, summary)
                     elif decision == "RELAND":
                         self.reland(row, cls, state, summary)
                     elif decision in ("HOLD", "REPAIR"):
                         self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                                  extra=self._watch(base, self._consumed_paths(value),
+                                  extra=self._watch(rbase, self._consumed_paths(value),
                                                     payloads=self._consumed_payloads(value)))
                     else:
                         self._retry(summary, n, cls or "ADMISSION_UNREAD")
-                summary["admitted"] = sorted(admitted)
+                summary["admitted"] = sorted(set(summary["admitted"]) | set(admitted))
                 if batch:
                     if summary["stopped"]:
                         for n in batch:
                             self._retry(summary, n, "TRAIN_STOPPED")
                     else:
-                        self.land(batch, rows, by_number, state, summary)
+                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
+                # a slot freed by a finished read is refilled from the current snapshot's queue
+                # (only when the round was cut short: the list is read again when it left candidates unread)
+                if (summary.get("deferred") and slots - len(self.inflight) > 0 and not summary["stopped"]
+                        and (deadline is None or time.monotonic() < deadline)):
+                    summary.pop("deferred", None)
+                    more = self._discover(requested, changed, state, summary, skip=set(self.inflight), seen=seen,
+                                          refill=True)
+                    # a declared head whose read failed this tick is not read again until the next tick lists: until
+                    # then no undeclared head is taken, so the declared lead the next tick instead of a whole backlog
+                    declared = (summary.get("admission_priority") or {}).get("read") or []
+                    unread = [n for n in declared if n in seen and n in summary["retry_later"]]
+                    if unread:
+                        more = [r for r in more or [] if int(r["number"]) in declared]
+                        summary["refill_stopped"] = {"declared_unread": unread}
+                        if not more:
+                            summary.pop("deferred", None)
+                    if more:
+                        more = self._owned_candidates(more, slots, summary)
+                        try:
+                            more_base = self._stage(more)
+                        except ReadFailed:
+                            more = []
+                        if more:
+                            seen.update({int(r["number"]): r.get("headRefOid") for r in more})
+                            self._submit(more, more_base)
                 self.save(state, summary)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            summary["inflight"] = sorted(self.inflight)
+            if not self.inflight:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool = None
+        summary["wall_seconds"] = round(time.monotonic() - started, 3)
         self.save(state, summary)
         return summary
 

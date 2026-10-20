@@ -473,8 +473,17 @@ class Daemon:
                     summary["admission_capacity"] = {"command": self.admission_capacity_command, "value": capacity,
                                                      "slots": slots}
         if self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="admission")
-            self._pool_slots = slots
+            # Bounded discovery submits only into currently admitted slots.
+            # Leave room for capacity to recover while original reads run.
+            # One-shot mode still queues its snapshot at the observed width.
+            self._pool_slots = (
+                self.admission_jobs
+                if self.tick_seconds is not None or self.admission_round_reads is not None
+                else slots
+            )
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._pool_slots, thread_name_prefix="admission"
+            )
         slots = min(slots, self._pool_slots)
         candidates = self._owned_candidates(candidates, slots, summary)
         if candidates:

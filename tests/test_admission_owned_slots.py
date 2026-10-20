@@ -76,5 +76,35 @@ class OwnedSlots(unittest.TestCase):
         self.assertIn('h3-changed', self.calls)
 
 
+    def test_capacity_growth_serves_current_work_while_an_original_read_runs(self):
+        self.owner.admission_capacity_command = 'echo 1'
+        first = self.owner.tick()
+
+        self.assertEqual(first['inflight'], [1])
+        self.assertEqual(self.calls, ['h1'])
+        original = self.owner.inflight[1]['future']
+
+        # A deferred head is read at its current source after capacity returns.
+        # The original admission stays live throughout that later landing.
+        self.open_head(2, 'h2-current')
+        self.owner.admission_capacity_command = 'echo 2'
+
+        deadline = time.monotonic() + 3
+        while 2 not in self.gh.merged and time.monotonic() < deadline:
+            self.owner.tick()
+
+        self.assertIn(
+            2, self.gh.merged,
+            'increased capacity did not let ready work pass the running read',
+        )
+        self.assertNotIn(1, self.gh.merged)
+        self.assertIn(1, self.owner.inflight)
+        self.assertIs(self.owner.inflight[1]['future'], original)
+        self.assertEqual(self.calls.count('h1'), 1)
+        self.assertNotIn('h2', self.calls)
+        self.assertEqual(self.calls.count('h2-current'), 1)
+
+
+
 if __name__ == '__main__':
     unittest.main()

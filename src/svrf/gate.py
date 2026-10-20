@@ -99,7 +99,16 @@ class CommandGate:
             slot.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "-C", str(self.clone), "worktree", "prune"], capture_output=True)
             self._git("worktree", "add", "-q", "--detach", "-f", str(slot), commit)
-        self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
+        # Git's immutable commit already owns this slot when HEAD and the tracked
+        # worktree/index still agree. Do not re-materialize the same source.
+        # Dirty or unreadable state takes the original force-checkout path.
+        head = subprocess.run(["git", "-C", str(slot), "rev-parse", "HEAD"],
+                              capture_output=True, text=True)
+        tracked = subprocess.run(["git", "-C", str(slot), "status", "--porcelain",
+                                  "--untracked-files=no"], capture_output=True, text=True)
+        if not (head.returncode == 0 and head.stdout.strip() == commit
+                and tracked.returncode == 0 and not tracked.stdout):
+            self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
         self._git("clean", "-fdq", cwd=slot)
 
     def _step(self, command: str, cwd: Path, log: Path, env: dict) -> tuple[int, str, float]:

@@ -117,7 +117,9 @@ class RealGitHub:
 
     def pull(self, number: int) -> dict:
         value = json.loads(self._gh(["api", f"repos/{self.repo}/pulls/{number}"], "rest"))
+        base = value.get("base") if isinstance(value, dict) else None
         return {"number": number, "head_sha": value["head"]["sha"], "head_ref": value["head"]["ref"],
+                "base_ref": base.get("ref") if isinstance(base, dict) else None,
                 "mergeable": value.get("mergeable"), "state": value.get("state"), "draft": value.get("draft"),
                 "labels": value.get("labels")}
 

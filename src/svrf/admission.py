@@ -177,17 +177,18 @@ class Admission:
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         deadline = time.monotonic() + self.timeout
         while True:
-            # The controller retires only an observed closed or replaced PR source.
-            # A completed command keeps its real result even if cancellation raced it.
-            if cancelled is not None and cancelled.is_set() and proc.poll() is None:
-                _kill_group(proc)
-                raise ReadFailed("ADMISSION_CANCELLED")
             remaining = max(0, deadline - time.monotonic())
             try:
                 stdout, stderr = proc.communicate(
                     timeout=min(remaining, 0.25) if cancelled is not None else remaining)
                 break
             except subprocess.TimeoutExpired:
+                # Communication must finish, not just the command leader: a child
+                # can keep inherited pipes open after its parent exits. Completed
+                # output keeps its original result even if cancellation raced it.
+                if cancelled is not None and cancelled.is_set():
+                    _kill_group(proc)
+                    raise ReadFailed("ADMISSION_CANCELLED")
                 if time.monotonic() >= deadline:
                     _kill_group(proc)
                     raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")

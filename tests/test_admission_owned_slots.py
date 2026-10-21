@@ -16,6 +16,7 @@ class OwnedSlots(unittest.TestCase):
         self.repo = DaemonRepo([1, 2, 3, 4, 5, 6])
         self.gh = DaemonGitHub(self.repo)
         self.release = threading.Event()
+        self.second_release = self.release
         self.calls = []
         self.lock = threading.Lock()
 
@@ -23,7 +24,8 @@ class OwnedSlots(unittest.TestCase):
             with self.lock:
                 self.calls.append(head)
             if head in ('h1', 'h2'):
-                if not self.release.wait(10):
+                release = self.second_release if head == 'h2' else self.release
+                if not release.wait(10):
                     raise RuntimeError('test admission was not released')
             return {'verdict': 'MERGEABLE', 'residuals': []}
 
@@ -59,6 +61,10 @@ class OwnedSlots(unittest.TestCase):
         self.assertEqual(set(self.calls), {'h1', 'h2'})
 
     def test_new_priority_is_read_before_an_unstarted_older_head(self):
+        # Free exactly one slot: with two free workers, callback start order is
+        # chosen by the thread scheduler, even when the priority is submitted first.
+        self.second_release = threading.Event()
+        self.addCleanup(self.second_release.set)
         self.owner.tick()
         self.open_head(99, 'h99')
         self.release.set()

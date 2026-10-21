@@ -17,6 +17,8 @@ from threading import RLock
 import time
 import uuid
 
+from .errors import ReadFailed
+
 _CURRENT = ContextVar("svrf_admission_attempt", default=None)
 MAX_PROGRESS_BYTES = 4 * 1024 * 1024
 MAX_EVENT_BYTES = 32768
@@ -252,7 +254,16 @@ class AdmissionAttempt:
             value, failure, seconds = function(*args)
             with self._lock:
                 self._finished = time.monotonic()
-                self.update(stage="complete", finished_at=self.clock(), result=value,
+                verdict = value.get("verdict") if isinstance(value, dict) else None
+                disposition = ("UNOBSERVED" if isinstance(failure, ReadFailed) else
+                               "EXECUTION_FAILED" if failure is not None else
+                               "ADMITTED" if verdict in ("MERGEABLE", "LANDED") else
+                               "HELD" if verdict == "HELD" else "UNOBSERVED")
+                finished = self.clock()
+                self.update(stage="complete", finished_at=finished, terminal_at=finished,
+                            terminal_disposition=disposition,
+                            exit=self._data.get("process", {}).get("returncode"),
+                            read_failed=isinstance(failure, ReadFailed), result=value,
                             read_failure=None if failure is None else {
                                 "type": type(failure).__name__,
                                 "reason": str(getattr(failure, "reason", failure)),
@@ -261,7 +272,11 @@ class AdmissionAttempt:
         except BaseException as error:
             with self._lock:
                 self._finished = time.monotonic()
-                self.update(stage="complete", finished_at=self.clock(), result=None,
+                finished = self.clock()
+                self.update(stage="complete", finished_at=finished, terminal_at=finished,
+                            terminal_disposition="EXECUTION_FAILED",
+                            exit=self._data.get("process", {}).get("returncode"),
+                            read_failed=isinstance(error, ReadFailed), result=None,
                             read_failure={"type": type(error).__name__, "reason": type(error).__name__})
             raise
         finally:

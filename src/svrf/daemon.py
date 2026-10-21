@@ -109,6 +109,7 @@ class Daemon:
         # future, row, base) persist, and the next tick's snapshot excludes those heads and collects them when done.
         self.tick_seconds = tick_seconds
         self.inflight: dict[int, dict] = {}
+        self._pending_attempt_history: dict[str, AdmissionAttempt] = {}
         self._pool, self._pool_slots = None, 1
 
     # ---- memory
@@ -137,15 +138,31 @@ class Daemon:
     def save(self, state: dict, summary: dict) -> None:
         # Discovery can stop before its normal completion path. The live owner,
         # rather than an initialized tick summary, always determines occupancy.
+        summary["observed_at"] = self.clock()
         summary["inflight"] = sorted(self.inflight)
         summary["admission_attempts"] = {
             str(n): {**item["attempt"].snapshot(), "future_done": item["future"].done()}
             for n, item in self.inflight.items() if item.get("attempt") is not None
         }
+        history = state.setdefault("admission_history", {})
+        received = []
+        for attempt_id, attempt in self._pending_attempt_history.items():
+            value = next((row for row in summary["admission_attempts"].values()
+                          if row["attempt_id"] == attempt_id), None)
+            value = value if value is not None else attempt.snapshot()
+            if value.get("finished_at") is not None:
+                history.setdefault(attempt_id, value)
+                received.append(attempt_id)
+        # The state is a bounded index. Every older original record remains on disk.
+        recent = sorted(history, key=lambda key: (
+            history[key].get("terminal_at", 0), history[key].get("started_monotonic", 0), key))[-32:]
+        state["admission_history"] = {key: history[key] for key in recent}
         if self.dry_run:
+            for attempt_id in received:
+                self._pending_attempt_history.pop(attempt_id, None)
             return
         state["last_tick"] = {k: summary[k] for k in (
-            "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
+            "tick", "at", "observed_at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
             "inflight", "admission_attempts", "admission_seconds", "wall_seconds",
             "admission_capacity", "admission_priority", "refill_stopped",
@@ -159,6 +176,8 @@ class Daemon:
             for n, item in self.inflight.items()
         })
         self._write(self.state_path, state)
+        for attempt_id in received:
+            self._pending_attempt_history.pop(attempt_id, None)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
                                                    "held": rows})
@@ -420,6 +439,7 @@ class Daemon:
             n = int(row["number"])
             attempt = AdmissionAttempt(self.state_dir, n, row.get("headRefOid"), base,
                                        clock=self.clock, persist=not self.dry_run)
+            self._pending_attempt_history[attempt._data["attempt_id"]] = attempt
             self.inflight[n] = {"future": self._pool.submit(attempt.run, self._timed_read, row, base),
                                 "row": row, "base": base, "inputs": self.round_inputs.get(n),
                                 "attempt": attempt}

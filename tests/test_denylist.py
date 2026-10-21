@@ -65,6 +65,16 @@ def _without_stdlib_options(text: str) -> str:
                 else:
                     bindings[name] = alias.name
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and node not in tree.body:
+            invalid.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            invalid.update(bindings)
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            invalid.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            invalid.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            invalid.add(node.rest)
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             invalid.add(node.id)
         elif isinstance(node, ast.arg):

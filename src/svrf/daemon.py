@@ -44,6 +44,7 @@ from typing import Callable
 
 from . import rules
 from .admission import Admission
+from .admission_attempt import AdmissionAttempt
 from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
 from .train import Train
@@ -134,18 +135,29 @@ class Daemon:
         tmp.replace(path)
 
     def save(self, state: dict, summary: dict) -> None:
+        # Discovery can stop before its normal completion path. The live owner,
+        # rather than an initialized tick summary, always determines occupancy.
+        summary["inflight"] = sorted(self.inflight)
+        summary["admission_attempts"] = {
+            str(n): {**item["attempt"].snapshot(), "future_done": item["future"].done()}
+            for n, item in self.inflight.items() if item.get("attempt") is not None
+        }
         if self.dry_run:
             return
         state["last_tick"] = {k: summary[k] for k in (
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
-            "inflight", "admission_seconds", "wall_seconds",
+            "inflight", "admission_attempts", "admission_seconds", "wall_seconds",
             "admission_capacity", "admission_priority", "refill_stopped",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
             for n, inputs in self.round_inputs.items() if "admission_base" in inputs
         }
+        state["last_tick"]["admission_sources"].update({
+            str(n): {"head": item["row"].get("headRefOid"), "base": item["base"]}
+            for n, item in self.inflight.items()
+        })
         self._write(self.state_path, state)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
@@ -406,8 +418,11 @@ class Daemon:
     def _submit(self, rows: list[dict], base: str) -> None:
         for row in rows:
             n = int(row["number"])
-            self.inflight[n] = {"future": self._pool.submit(self._timed_read, row, base), "row": row, "base": base,
-                                "inputs": self.round_inputs.get(n)}
+            attempt = AdmissionAttempt(self.state_dir, n, row.get("headRefOid"), base,
+                                       clock=self.clock, persist=not self.dry_run)
+            self.inflight[n] = {"future": self._pool.submit(attempt.run, self._timed_read, row, base),
+                                "row": row, "base": base, "inputs": self.round_inputs.get(n),
+                                "attempt": attempt}
 
     def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
         """Leave unstarted heads for discovery at their current source and priority."""
@@ -420,7 +435,15 @@ class Daemon:
         return rows[:free]
 
     def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
-        summary = self._tick_body(requested, changed)
+        try:
+            summary = self._tick_body(requested, changed)
+        except Exception as error:
+            try:
+                self.save(self.load_state(), {"tick": "ERROR", "at": _stamp(self.clock),
+                                               "reason": "TICK_FAILED:" + type(error).__name__})
+            except OSError:
+                pass  # A failed observation write must not replace the original error.
+            raise
         if summary.get("tick") == "RAN" and not self.dry_run:
             self._write_tick_receipt(summary)
         return summary

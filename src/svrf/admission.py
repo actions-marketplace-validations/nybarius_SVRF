@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from . import history, rules
+from .admission_attempt import command_environment, command_started, command_finished
 from .errors import ReadFailed
 from .locks import SlotPool
 from .redact import redact
@@ -162,7 +163,7 @@ class Admission:
     def _execute_command(self, head: str, base: str, root: Path,
                          reads: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
-               "SVRF_ADMISSION_READS": str(reads)}
+               "SVRF_ADMISSION_READS": str(reads), **command_environment()}
         if pr is not None:
             env["SVRF_PR"] = str(pr)
         # The command runs in its own session: a timeout kills the whole process group (bash and
@@ -170,12 +171,14 @@ class Admission:
         # running on the host to slow every later read into the same timeout.
         proc = subprocess.Popen(["bash", "-c", self.command], cwd=str(root), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        command_started(proc, root)
         try:
             stdout, stderr = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc)
             raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        command_finished(done.returncode)
         if done.returncode in UNAVAILABLE_EXITS:
             if done.returncode == 126:
                 named = [line[:200] for line in (ln.strip() for ln in redact(done.stdout + done.stderr, env).splitlines())

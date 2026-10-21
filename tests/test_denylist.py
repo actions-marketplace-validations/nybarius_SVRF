@@ -7,7 +7,10 @@ Run `python3 tests/test_denylist.py --show` to print the decoded list.
 
 from __future__ import annotations
 
+import ast
 import codecs
+import inspect
+import json
 import re
 import subprocess
 import sys
@@ -38,9 +41,67 @@ def files() -> list[Path]:
 PATTERNS = [(t, re.compile(r"(?<![a-z])" + re.escape(t))) for t in TERMS]
 
 
+def _without_stdlib_options(text: str) -> str:
+    """Exclude only verified standard JSON option identifiers, never their values."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return text
+    bindings, invalid = {}, set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name in bindings or alias.name != "json":
+                    invalid.add(name)
+                else:
+                    bindings[name] = "module"
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if (name in bindings or node.module != "json" or node.level
+                        or alias.name not in ("dumps", "JSONEncoder")):
+                    invalid.add(name)
+                else:
+                    bindings[name] = alias.name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            invalid.add(node.id)
+        elif isinstance(node, ast.arg):
+            invalid.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            invalid.add(node.name)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name):
+                invalid.add(root.id)
+    bindings = {name: target for name, target in bindings.items() if name not in invalid}
+    signatures = {name: inspect.signature(getattr(json, name)).parameters
+                  for name in ("dumps", "JSONEncoder")}
+    lines = [bytearray(line.encode()) for line in text.splitlines(keepends=True)]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = None
+        if isinstance(node.func, ast.Name):
+            target = bindings.get(node.func.id)
+        elif (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+              and bindings.get(node.func.value.id) == "module"):
+            target = node.func.attr
+        if target not in signatures:
+            continue
+        for option in node.keywords:
+            if option.arg in signatures[target]:
+                begin, size = option.col_offset, len(option.arg.encode())
+                lines[option.lineno - 1][begin:begin + size] = b" " * size
+    return b"".join(lines).decode()
+
+
 def hits(text: str) -> list[str]:
     """Terms found at the start of a word (so a term also matches its longer forms)."""
-    lowered = text.lower()
+    lowered = _without_stdlib_options(text).lower()
     return [t for t, pattern in PATTERNS if pattern.search(lowered)]
 
 

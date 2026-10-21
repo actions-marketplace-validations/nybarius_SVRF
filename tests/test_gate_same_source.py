@@ -44,3 +44,25 @@ class SameSourceGate(unittest.TestCase):
             (slot / "source.txt").write_text("tamper\n")
             gate._prepare(slot, head)
             self.assertEqual((slot / "source.txt").read_text(), "source\n")
+
+    def test_index_flags_cannot_hide_changed_source_from_gate(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "repository"
+                root.mkdir()
+                git(root, "init", "-q", "-b", "main")
+                (root / "source.txt").write_text("source\n")
+                git(root, "add", ".")
+                git(root, "commit", "-qm", "source")
+                head = git(root, "rev-parse", "HEAD").strip()
+                gate = CommandGate(root, Path(tmp) / "slots", 1,
+                                   ["test \"$(cat source.txt)\" = source"],
+                                   logs=Path(tmp) / "logs")
+                slot = Path(tmp) / "slots" / "slot-0"
+                gate._prepare(slot, head)
+                git(slot, "update-index", flag, "source.txt")
+                (slot / "source.txt").write_text("tamper\n")
+                self.assertEqual(git(slot, "status", "--porcelain"), "")
+                result = gate.run(head, head, flag)
+                self.assertTrue(result["green"], result)
+                self.assertEqual((slot / "source.txt").read_text(), "source\n")

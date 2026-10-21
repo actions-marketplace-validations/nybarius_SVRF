@@ -99,14 +99,25 @@ class CommandGate:
             slot.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "-C", str(self.clone), "worktree", "prune"], capture_output=True)
             self._git("worktree", "add", "-q", "--detach", "-f", str(slot), commit)
-        # Git's immutable commit already owns this slot when HEAD and the tracked
-        # worktree/index still agree. Do not re-materialize the same source.
-        # Dirty or unreadable state takes the original force-checkout path.
+        # Index flags can hide changed bytes from status and skip-worktree can
+        # also suppress force-checkout. Remove those flags under the slot lock;
+        # a masked slot must be restored even when status previously looked clean.
+        entries = subprocess.run(["git", "-C", str(slot), "ls-files", "-v", "-z"],
+                                 check=True, capture_output=True).stdout.split(b"\0")
+        assumed = [e[2:] for e in entries if e[:1].islower()]
+        skipped = [e[2:] for e in entries if e[:1].upper() == b"S"]
+        for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+            if paths:
+                subprocess.run(["git", "-C", str(slot), "update-index", option, "-z", "--stdin"],
+                               input=b"\0".join(paths) + b"\0", check=True, capture_output=True)
         head = subprocess.run(["git", "-C", str(slot), "rev-parse", "HEAD"],
                               capture_output=True, text=True)
-        tracked = subprocess.run(["git", "-C", str(slot), "status", "--porcelain",
-                                  "--untracked-files=no"], capture_output=True, text=True)
-        if not (head.returncode == 0 and head.stdout.strip() == commit
+        tracked = subprocess.run(["git", "-C", str(slot), "-c", "core.fsmonitor=false",
+                                  "-c", "core.ignorestat=false", "-c", "core.trustctime=true",
+                                  "status", "--porcelain", "--untracked-files=no"],
+                                 capture_output=True, text=True)
+        if not (not assumed and not skipped
+                and head.returncode == 0 and head.stdout.strip() == commit
                 and tracked.returncode == 0 and not tracked.stdout):
             self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
         self._git("clean", "-fdq", cwd=slot)

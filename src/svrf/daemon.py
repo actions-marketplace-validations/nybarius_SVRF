@@ -563,12 +563,6 @@ class Daemon:
                     else:
                         self._retry(summary, n, cls or "ADMISSION_UNREAD")
                 summary["admitted"] = sorted(set(summary["admitted"]) | set(admitted))
-                if batch:
-                    if summary["stopped"]:
-                        for n in batch:
-                            self._retry(summary, n, "TRAIN_STOPPED")
-                    else:
-                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
                 # a slot freed by a finished read is refilled from the current snapshot's queue
                 # (only when the round was cut short: the list is read again when it left candidates unread)
                 if (summary.get("deferred") and slots - len(self.inflight) > 0 and not summary["stopped"]
@@ -595,6 +589,14 @@ class Daemon:
                         if more:
                             seen.update({int(r["number"]): r.get("headRefOid") for r in more})
                             self._submit(more, more_base)
+                # Refill free admission slots before the synchronous final gate.
+                # The single landing owner still gates each batch on current main.
+                if batch:
+                    if summary["stopped"]:
+                        for n in batch:
+                            self._retry(summary, n, "TRAIN_STOPPED")
+                    else:
+                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
                 self.save(state, summary)
         finally:
             summary["inflight"] = sorted(self.inflight)

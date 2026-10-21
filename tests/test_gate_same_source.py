@@ -1,4 +1,4 @@
-"""Same-source gate preparation must not rewrite an already verified worktree."""
+"""Gate preparation materializes a new slot once and restores reused source."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +8,7 @@ from svrf.gate import CommandGate
 
 
 class SameSourceGate(unittest.TestCase):
-    def test_second_preparation_of_same_clean_commit_avoids_checkout(self):
+    def test_initial_preparation_does_not_repeat_worktree_materialization(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repository"
             root.mkdir()
@@ -19,7 +19,6 @@ class SameSourceGate(unittest.TestCase):
             head = git(root, "rev-parse", "HEAD").strip()
             gate = CommandGate(root, Path(tmp) / "slots", 1, ["true"], logs=Path(tmp) / "logs")
             slot = Path(tmp) / "slots" / "slot-0"
-            gate._prepare(slot, head)
             original = gate._git
             calls = []
             def traced(*args, **kwargs):
@@ -27,7 +26,13 @@ class SameSourceGate(unittest.TestCase):
                 return original(*args, **kwargs)
             with patch.object(gate, "_git", side_effect=traced):
                 gate._prepare(slot, head)
+            self.assertEqual(sum(args[:2] == ("worktree", "add") for args in calls), 1)
             self.assertFalse(any(args and args[0] == "checkout" for args in calls), calls)
+            calls.clear()
+            with patch.object(gate, "_git", side_effect=traced):
+                gate._prepare(slot, head)
+            self.assertEqual(sum(args and args[0] == "checkout" for args in calls), 1)
+            self.assertEqual((slot / "source.txt").read_text(), "source\n")
 
     def test_dirty_tracked_source_is_restored_before_gate(self):
         with tempfile.TemporaryDirectory() as tmp:

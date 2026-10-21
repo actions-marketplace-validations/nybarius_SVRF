@@ -121,19 +121,35 @@ class ReadBackoff(unittest.TestCase):
         self.assertEqual(row["completed_work_ids"], ["original-receipt-a"])
         self.assertEqual(row["retry_at"], self.clock() + 30)
 
-    def test_absent_mixed_incomplete_or_corrupt_progress_never_proves_zero_work(self):
+    def test_repeated_unknown_read_failures_defer_without_claiming_zero_work(self):
         for mode in ("absent", "mixed", "incomplete", "corrupt"):
             with self.subTest(mode=mode):
                 self.read.events = mode
+                self.read.command = "read-" + mode
                 before = self.read.calls
-                for _ in range(5):
+                for _ in range(3):
                     self.owner.tick()
                 row = self.row()
-                self.assertEqual(self.read.calls, before + 5)
                 self.assertEqual(row["coverage_status"], "UNOBSERVED")
                 self.assertIsNone(row["no_progress_failures"])
-                self.assertIsNone(row["retry_at"])
-                self.assertGreaterEqual(row["read_failure_count"], 5)
+                self.assertEqual(row.get("unobserved_failures"), 3)
+                self.assertEqual(row.get("backoff_kind"), "REPEATED_UNOBSERVED")
+                self.assertEqual(row["retry_at"], self.clock() + 30)
+                self.clock.sleep(5)
+                tick = self.owner.tick()
+                self.assertEqual(self.read.calls, before + 3, "identical unread work occupied a fourth slot")
+                self.assertEqual(self.row(), row, "a diagnostic observation changed the original deadline")
+                self.assertEqual(tick["inflight"], [])
+                self.assertEqual(tick["held"], [])
+
+    def test_different_unknown_observation_reasons_do_not_accumulate_one_cooldown(self):
+        for mode in ("absent", "mixed", "corrupt"):
+            self.read.events = mode
+            self.owner.tick()
+            row = self.row()
+            self.assertEqual(row.get("unobserved_failures"), 1)
+            self.assertIsNone(row["retry_at"])
+            self.assertIsNone(row["no_progress_failures"])
 
     def test_actual_head_base_command_and_environment_changes_clear_a_deadline(self):
         changes = [

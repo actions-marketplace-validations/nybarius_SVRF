@@ -214,7 +214,7 @@ class CommandAttemptState(unittest.TestCase):
         marker = self.root / "command.json"
         script = (
             "import json,os,pathlib,sys,time; "
-            "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),"
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'owner_pid':os.getppid(),"
             "'progress_file':os.environ.get('SVRF_ADMISSION_PROGRESS_FILE')})); "
             "\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
         )
@@ -233,7 +233,8 @@ class CommandAttemptState(unittest.TestCase):
         row = attempts["1"]
         self.assertEqual((row["head"], row["base"]), ("h1", "c0"))
         self.assertEqual(row["stage"], "command")
-        self.assertEqual(row["process"]["pid"], command_row["pid"])
+        self.assertEqual(row["process"]["pid"], command_row["owner_pid"])
+        self.assertNotEqual(row["process"]["pid"], command_row["pid"])
         self.assertIsInstance(row["process"]["start_ticks"], int)
         self.assertTrue(row["process"]["boot_id"])
         self.assertEqual(row["slot"], str(self.root))
@@ -258,7 +259,7 @@ class CommandAttemptState(unittest.TestCase):
         script = (
             "import json,os,pathlib,sys,time; "
             "p=pathlib.Path(sys.argv[1])/(os.environ['SVRF_PR']+'.json'); "
-            "p.write_text(json.dumps({'pid':os.getpid(),'head':os.environ['SVRF_HEAD'],"
+            "p.write_text(json.dumps({'pid':os.getpid(),'owner_pid':os.getppid(),'head':os.environ['SVRF_HEAD'],"
             "'progress_file':os.environ.get('SVRF_ADMISSION_PROGRESS_FILE')})); "
             "\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
         )
@@ -277,7 +278,8 @@ class CommandAttemptState(unittest.TestCase):
         for number, row in attempts.items():
             actual = json.loads((self.root / (number + ".json")).read_text())
             self.assertEqual(row["head"], actual["head"])
-            self.assertEqual(row["process"]["pid"], actual["pid"])
+            self.assertEqual(row["process"]["pid"], actual["owner_pid"])
+            self.assertNotEqual(row["process"]["pid"], actual["pid"])
             self.assertEqual(row["progress_file"], actual["progress_file"])
             self.assertIn(row["attempt_id"], actual["progress_file"])
             paths.add(actual["progress_file"])

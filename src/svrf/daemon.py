@@ -38,6 +38,7 @@ import subprocess
 import json
 import math
 import time
+from threading import Event
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
@@ -169,7 +170,7 @@ class Daemon:
             "tick", "at", "observed_at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
             "inflight", "admission_attempts", "admission_seconds", "wall_seconds",
-            "admission_capacity", "admission_priority", "admission_backoff", "refill_stopped",
+            "admission_capacity", "admission_priority", "admission_backoff", "refill_stopped", "admission_cancelled",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -290,18 +291,21 @@ class Daemon:
             summary["retry_later"].append(n)
         summary["reasons"][str(n)] = reason
 
-    def _read_admission(self, row: dict, base: str) -> tuple[dict | None, Exception | None]:
+    def _read_admission(self, row: dict, base: str, cancelled=None) -> tuple[dict | None, Exception | None]:
         """One admission read, run on the executor: admitted by the memory guard the gate
         also uses (the admission command can run the same heavy suite), so this and a
         running gate never together exceed the host's reserved memory."""
         head = row.get("headRefOid")
         # Only the built-in Admission takes the PR number (SVRF_PR); other callables keep (head, base).
         extra = (row["number"],) if isinstance(self.admission, Admission) and row.get("number") is not None else ()
+        options = {"cancelled": cancelled} if cancelled is not None else {}
         try:
+            if cancelled is not None and cancelled.is_set():
+                raise ReadFailed("ADMISSION_CANCELLED")
             if self.memory is not None:
                 with self.memory.admit():
-                    return self.admission(head, base, *extra), None
-            return self.admission(head, base, *extra), None
+                    return self.admission(head, base, *extra, **options), None
+            return self.admission(head, base, *extra, **options), None
         except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
             return None, error
 
@@ -333,6 +337,7 @@ class Daemon:
             self.save(state, summary)
             return None
         by_number = {int(r["number"]): r for r in rows}
+        self._cancel_obsolete_admissions(by_number)
         self.round_rows.update(by_number)
         stacked_on = {r.get("baseRefName") for r in rows}
         for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"],
@@ -474,22 +479,66 @@ class Daemon:
                 inputs["admission_watch"] = {"paths": list(self.admission_watch), "value": watch}
         return base
 
-    def _timed_read(self, row: dict, base: str):
+    def _cancel_obsolete_admissions(self, current: dict[int, dict]) -> None:
+        """Cancel commands only after a positive PR closure or head-replacement read."""
+        if not isinstance(self.admission, Admission):
+            return
+        for number, item in self.inflight.items():
+            cancelled = item.get("cancelled")
+            if cancelled is None or cancelled.is_set() or item["future"].done():
+                continue
+            watched = item.get("reland", {}).get("row", item["row"])
+            expected = watched.get("headRefOid")
+            if not isinstance(expected, str) or not expected:
+                continue
+            row = current.get(number)
+            reason = None
+            if row is not None:
+                observed = row.get("headRefOid")
+                if isinstance(observed, str) and observed and observed != expected:
+                    reason = "HEAD_CHANGED"
+            else:
+                # Snapshot absence can be a partial read. Confirm the source through
+                # its own PR endpoint instead of cancelling on that absence alone.
+                try:
+                    row = self.gh.pull(number)
+                except (ReadFailed, KeyError, TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict) or row.get("number") != number:
+                    continue
+                observed = row.get("head_sha")
+                if not isinstance(observed, str) or not observed:
+                    continue
+                if row.get("state") == "closed":
+                    reason = "PR_CLOSED"
+                elif row.get("state") == "open" and observed != expected:
+                    reason = "HEAD_CHANGED"
+            if reason:
+                item["cancellation"] = {
+                    "number": number, "head": item["row"].get("headRefOid"),
+                    "base": item["base"], "expected_pr_head": expected,
+                    "observed_pr_head": observed, "reason": reason,
+                }
+                cancelled.set()
+
+    def _timed_read(self, row: dict, base: str, cancelled=None):
         started = time.monotonic()
-        value, failure = self._read_admission(row, base)
+        value, failure = (self._read_admission(row, base) if cancelled is None
+                          else self._read_admission(row, base, cancelled))
         return value, failure, time.monotonic() - started
 
     def _submit(self, rows: list[dict], base: str) -> None:
         for row in rows:
             n = int(row["number"])
+            cancelled = Event() if isinstance(self.admission, Admission) else None
             source = source_identity(self.admission, n, row.get("headRefOid"), base,
                                      self.round_inputs.get(n))
             attempt = AdmissionAttempt(self.state_dir, n, row.get("headRefOid"), base,
                                        clock=self.clock, persist=not self.dry_run, source=source)
             self._pending_attempt_history[attempt._data["attempt_id"]] = attempt
-            self.inflight[n] = {"future": self._pool.submit(attempt.run, self._timed_read, row, base),
-                                "row": row, "base": base, "inputs": self.round_inputs.get(n),
-                                "attempt": attempt}
+            self.inflight[n] = {"future": self._pool.submit(attempt.run, self._timed_read, row, base, cancelled),
+                                "row": row, "base": base, "cancelled": cancelled,
+                                "inputs": self.round_inputs.get(n), "attempt": attempt}
 
     def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
         """Leave unstarted heads for discovery at their current source and priority."""
@@ -522,7 +571,7 @@ class Daemon:
                "admission_seconds": summary["admission_seconds"], "admitted": summary["admitted"],
                "merged": summary["merged"], "inflight": summary["inflight"], "receipts": summary["receipts"]}
         row.update({key: summary[key] for key in
-                    ("admission_capacity", "admission_priority", "refill_stopped") if key in summary})
+                    ("admission_capacity", "admission_priority", "refill_stopped", "admission_cancelled") if key in summary})
         self.receipts.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         path = self.receipts / f"tick-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json"
@@ -617,6 +666,14 @@ class Daemon:
                     known[n] = row
                     value, failure, seconds = future.result()
                     summary["admission_seconds"][str(n)] = round(seconds, 3)
+                    if "cancellation" in item:
+                        summary.setdefault("admission_cancelled", []).append({
+                            **item["cancellation"], "seconds": round(seconds, 3),
+                            "returned": value,
+                            "read_failure": (failure.reason if isinstance(failure, ReadFailed)
+                                             else type(failure).__name__ if failure else None),
+                        })
+                        continue  # retirement is neither an admission nor a hold
                     if self.admission_round_reads:
                         state.setdefault("waiting_since", {})[str(n)] = self.clock()
                     if "reland" in item:
@@ -653,12 +710,6 @@ class Daemon:
                     else:
                         self._retry(summary, n, cls or "ADMISSION_UNREAD")
                 summary["admitted"] = sorted(set(summary["admitted"]) | set(admitted))
-                if batch:
-                    if summary["stopped"]:
-                        for n in batch:
-                            self._retry(summary, n, "TRAIN_STOPPED")
-                    else:
-                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
                 # a slot freed by a finished read is refilled from the current snapshot's queue
                 # (only when the round was cut short: the list is read again when it left candidates unread)
                 if (summary.get("deferred") and slots - len(self.inflight) > 0 and not summary["stopped"]
@@ -685,6 +736,14 @@ class Daemon:
                         if more:
                             seen.update({int(r["number"]): r.get("headRefOid") for r in more})
                             self._submit(more, more_base)
+                # Refill free admission slots before the synchronous final gate.
+                # The single landing owner still gates each batch on current main.
+                if batch:
+                    if summary["stopped"]:
+                        for n in batch:
+                            self._retry(summary, n, "TRAIN_STOPPED")
+                    else:
+                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
                 self.save(state, summary)
         finally:
             summary["inflight"] = sorted(self.inflight)

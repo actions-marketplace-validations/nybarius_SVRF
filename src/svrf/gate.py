@@ -99,7 +99,18 @@ class CommandGate:
             slot.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "-C", str(self.clone), "worktree", "prune"], capture_output=True)
             self._git("worktree", "add", "-q", "--detach", "-f", str(slot), commit)
-        self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
+        else:
+            # A reused slot may carry flags that hide changed bytes. Clear each
+            # kind independently; skip-worktree also suppresses force-checkout.
+            entries = subprocess.run(["git", "-C", str(slot), "ls-files", "-v", "-z"],
+                                     check=True, capture_output=True).stdout.split(b"\0")
+            assumed = [e[2:] for e in entries if e[:1].islower()]
+            skipped = [e[2:] for e in entries if e[:1].upper() == b"S"]
+            for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+                if paths:
+                    subprocess.run(["git", "-C", str(slot), "update-index", option, "-z", "--stdin"],
+                                   input=b"\0".join(paths) + b"\0", check=True, capture_output=True)
+            self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
         self._git("clean", "-fdq", cwd=slot)
 
     def _step(self, command: str, cwd: Path, log: Path, env: dict) -> tuple[int, str, float]:

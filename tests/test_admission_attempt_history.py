@@ -92,6 +92,9 @@ class AttemptHistory(unittest.TestCase):
         owner.tick()
         first = next(iter(self.history().values()))
         for _ in range(34):
+            retry_at = owner.load_state().get("admission_retries", {}).get("1", {}).get("retry_at")
+            if retry_at is not None and retry_at > owner.clock():
+                owner.sleep(retry_at - owner.clock())
             owner.tick()
         history = self.history()
         self.assertEqual(len(history), 32)

@@ -51,7 +51,7 @@ def _without_stdlib_options(text: str) -> str:
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                name = alias.asname or alias.name
+                name = alias.asname or alias.name.split(".")[0]
                 if name in bindings or alias.name != "json":
                     invalid.add(name)
                 else:

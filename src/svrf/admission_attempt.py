@@ -182,7 +182,7 @@ def read_progress(path: Path, *, expected: dict | None = None,
 
 
 class AdmissionAttempt:
-    def __init__(self, state_dir: Path, pr: int, head: str, base: str, *, clock=time.time, persist=True):
+    def __init__(self, state_dir: Path, pr: int, head: str, base: str, *, clock=time.time, persist=True, source=None):
         self.clock, self.persist = clock, persist
         self._lock = RLock()
         self._finished = None
@@ -198,6 +198,8 @@ class AdmissionAttempt:
             "started_at": clock(), "started_monotonic": self._started, "stage": "queued",
             "record_file": str(self.path), "progress_file": str(self.progress_file),
         }
+        if source is not None:
+            self._data.update(source)
         self.snapshot()  # Persist the source before an executor can start it.
 
     def _write(self, value: dict) -> None:

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from fakes import DaemonGitHub, DaemonRepo, FakeGate
+from fakes import Clock, DaemonGitHub, DaemonRepo, FakeGate
 from test_daemon import daemon
 from svrf.admission import Admission
 from svrf.errors import ReadFailed
@@ -98,6 +98,21 @@ class AttemptHistory(unittest.TestCase):
         self.assertNotIn(first["attempt_id"], history)
         self.assertTrue(Path(first["record_file"]).is_file())
         self.assertEqual(len(list((self.root / "admission-attempts").glob("*.json"))), 35)
+
+    def test_saved_observation_time_advances_at_the_rate_floor_without_new_work(self):
+        clock = Clock()
+        self.gh.remaining = 0
+        self.owner = daemon(self.repo, self.gh, FakeGate(self.repo), lambda *args: None,
+                            self.root, clock=clock)
+        self.owner.tick()
+        first = self.owner.load_state()["last_tick"]
+        self.assertEqual(first.get("observed_at"), 1000.0, "saved state has no numeric observation time")
+        clock.sleep(17)
+        self.owner.tick()
+        current = self.owner.load_state()["last_tick"]
+        self.assertEqual(current["observed_at"], 1017.0)
+        self.assertEqual(current["inflight"], [])
+        self.assertEqual(self.history(), {})
 
     def test_loaded_history_survives_a_new_owner_without_creating_new_work(self):
         def unavailable(head, base):

@@ -241,6 +241,7 @@ class CommandAttemptState(unittest.TestCase):
         self.assertFalse(row["future_done"])
         self.assertFalse(Path(row["progress_file"]).exists())
         self.release.touch()
+        owner.inflight[1]["future"].result(timeout=10)
         owner.tick(drain=True)
         completed = json.loads(Path(row["record_file"]).read_text())
         self.assertEqual(completed["stage"], "complete")
@@ -285,6 +286,9 @@ class CommandAttemptState(unittest.TestCase):
     def test_exit_126_keeps_its_actual_reason_and_terminal_record_without_becoming_a_hold(self):
         owner = self.make_owner("echo IO_POOL_CAPACITY; exit 126")
         result = owner.tick()
+        if owner.inflight:
+            owner.inflight[1]["future"].result(timeout=10)
+            result = owner.tick(drain=True)
         self.assertEqual(result["retry_later"], [1])
         self.assertEqual(result["reasons"]["1"], "IO_POOL_CAPACITY")
         self.assertEqual(result["held"], [])

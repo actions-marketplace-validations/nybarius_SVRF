@@ -70,14 +70,17 @@ class AttemptState(unittest.TestCase):
         self.assertEqual(len(self.calls), 4)
 
     def test_each_saved_round_binds_the_observed_progress_bytes_and_last_event(self):
+        from test_admission_progress_projection import beginning, encode_events
         first = self.owner.tick()
         attempts = first.get("admission_attempts", {})
         self.assertIn("1", attempts)
         self.assertEqual(attempts["1"]["progress"]["status"], "UNOBSERVED")
         path = Path(attempts["1"]["progress_file"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        one = {"kind": "stage_start", "stage": "scan", "seq": 0}
-        path.write_text(json.dumps(one) + "\n")
+        rows = [beginning(), {"kind": "start", "span": "scan", "stage": "scan"}]
+        raw = encode_events(rows)
+        one = json.loads(raw.splitlines()[-1])
+        path.write_bytes(raw)
         self.gh.remaining = 0
         second = self.owner.tick()["admission_attempts"]["1"]
         progress = second["progress"]
@@ -85,9 +88,12 @@ class AttemptState(unittest.TestCase):
         self.assertEqual(progress["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertEqual(progress["last_event"], one)
         previous_state = self.owner.state_path.read_bytes()
-        two = {"kind": "progress", "completed": 7, "seq": 1}
-        with path.open("a") as stream:
-            stream.write(json.dumps(two) + "\n")
+        rows.append({"kind": "progress", "work_id": "receipt-a", "obligation": "tests/test_a.py",
+                     "outcome": 0, "provenance": "COMPUTED"})
+        after = encode_events(rows)
+        two = json.loads(after.splitlines()[-1])
+        with path.open("ab") as stream:
+            stream.write(after[len(raw):])
         third = self.owner.tick()["admission_attempts"]["1"]
         self.assertNotEqual(third["progress"]["sha256"], progress["sha256"])
         self.assertEqual(third["progress"]["last_event"], two)

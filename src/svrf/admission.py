@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -113,7 +114,9 @@ class Admission:
         self.refactor_prefixes, self.command, self.timeout = refactor_prefixes, command, timeout
         self.pool = SlotPool(Path(pool), slots) if pool is not None else None
 
-    def __call__(self, head: str, base: str, pr: int | None = None) -> dict:
+    def __call__(self, head: str, base: str, pr: int | None = None, *, cancelled=None) -> dict:
+        if cancelled is not None and cancelled.is_set():
+            raise ReadFailed("ADMISSION_CANCELLED")
         if self.git.is_ancestor(head, base):
             return {"verdict": "LANDED", "residuals": [], "changed": []}
         residuals: list[str] = []
@@ -128,19 +131,19 @@ class Admission:
                 residuals.append(f"history:{result}")
         consumed = None
         if self.command:
-            lines, consumed = self._command(head, base, pr)
+            lines, consumed = self._command(head, base, pr, cancelled=cancelled)
             residuals += lines
         value = {"verdict": "HELD" if residuals else "MERGEABLE", "residuals": residuals, "changed": changed}
         if consumed is not None:
             value["consumed"] = consumed
         return value
 
-    def _command(self, head: str, base: str, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
+    def _command(self, head: str, base: str, pr: int | None = None, *, cancelled=None) -> tuple[list[str], list[dict] | None]:
         if self.pool is None:
-            return self._run_command(head, base, self.git.root, pr)
+            return self._run_command(head, base, self.git.root, pr, cancelled=cancelled)
         slot = self.pool.acquire()
         try:
-            return self._run_command(head, base, self._slot_root(slot), pr)
+            return self._run_command(head, base, self._slot_root(slot), pr, cancelled=cancelled)
         finally:
             self.pool.release(slot)
 
@@ -155,12 +158,14 @@ class Admission:
                             str(slot), "HEAD"], check=True, capture_output=True)
         return slot
 
-    def _run_command(self, head: str, base: str, root: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
+    def _run_command(self, head: str, base: str, root: Path, pr: int | None = None, *, cancelled=None) -> tuple[list[str], list[dict] | None]:
         with tempfile.TemporaryDirectory(prefix="svrf-admission-reads-") as scratch:
-            return self._execute_command(head, base, root, Path(scratch) / "reads.json", pr)
+            return self._execute_command(head, base, root, Path(scratch) / "reads.json", pr, cancelled=cancelled)
 
     def _execute_command(self, head: str, base: str, root: Path,
-                         reads: Path, pr: int | None = None) -> tuple[list[str], list[dict] | None]:
+                         reads: Path, pr: int | None = None, *, cancelled=None) -> tuple[list[str], list[dict] | None]:
+        if cancelled is not None and cancelled.is_set():
+            raise ReadFailed("ADMISSION_CANCELLED")
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
                "SVRF_ADMISSION_READS": str(reads)}
         if pr is not None:
@@ -170,11 +175,22 @@ class Admission:
         # running on the host to slow every later read into the same timeout.
         proc = subprocess.Popen(["bash", "-c", self.command], cwd=str(root), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        try:
-            stdout, stderr = proc.communicate(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            _kill_group(proc)
-            raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            # The controller retires only an observed closed or replaced PR source.
+            # A completed command keeps its real result even if cancellation raced it.
+            if cancelled is not None and cancelled.is_set() and proc.poll() is None:
+                _kill_group(proc)
+                raise ReadFailed("ADMISSION_CANCELLED")
+            remaining = max(0, deadline - time.monotonic())
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=min(remaining, 0.25) if cancelled is not None else remaining)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    _kill_group(proc)
+                    raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
             if done.returncode == 126:

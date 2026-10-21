@@ -140,6 +140,7 @@ class Daemon:
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
             "inflight", "admission_seconds", "wall_seconds",
+            "admission_capacity", "admission_priority", "refill_stopped",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -339,10 +340,6 @@ class Daemon:
                 self.stacked(row, heads, state, summary)
             else:
                 summary["skipped"][str(n)] = decision
-        # A backlog (more candidates than admission slots) is read newest first, and a head whose read failed last
-        # tick after the rest, so old or unread heads never hold fresh admissions behind them; every candidate is
-        # still read this tick. Without a backlog every read starts at once and the order is kept.
-        bounded = bool(self.admission_round_reads) and len(candidates) > self.admission_round_reads
         if self.admission_round_reads:
             # every candidate waits from when it is first seen, and again from each read of it; a head that is no
             # longer a candidate (landed, closed, held) leaves the queue
@@ -351,7 +348,17 @@ class Daemon:
             for n in current:
                 waiting.setdefault(n, self.clock())
             state["waiting_since"] = waiting
-        if bounded or len(candidates) > max(1, self.admission_jobs):
+        return candidates
+
+    def _order_candidates(self, candidates: list[dict], slots: int, state: dict, summary: dict) -> list[dict]:
+        """Order after observing capacity, before an unstarted head takes a free slot."""
+        free = max(0, slots - len(self.inflight))
+        if not free:
+            return candidates  # no new read can start; the next discovery reads priority again
+        bounded = bool(self.admission_round_reads) and len(candidates) > self.admission_round_reads
+        # A backlog reads declared heads first, then the existing age or retry order.
+        # When every candidate fits, keep the list order without another command.
+        if bounded or len(candidates) > free:
             unread = {int(n) for n in (state.get("last_tick") or {}).get("retry_later") or [] if str(n).isdigit()}
             rank: dict[int, int] = {}
             if self.admission_priority_command:
@@ -420,10 +427,12 @@ class Daemon:
 
     def _write_tick_receipt(self, summary: dict) -> None:
         """What a landings-per-hour and an intake-time read consume: the tick's wall time, each admission's
-        duration, and what it landed."""
+        duration, what it landed, and the last scheduling observations in its summary."""
         row = {"schema_version": "svrf.tick/1", "at": summary["at"], "wall_seconds": summary.get("wall_seconds"),
                "admission_seconds": summary["admission_seconds"], "admitted": summary["admitted"],
                "merged": summary["merged"], "inflight": summary["inflight"], "receipts": summary["receipts"]}
+        row.update({key: summary[key] for key in
+                    ("admission_capacity", "admission_priority", "refill_stopped") if key in summary})
         self.receipts.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         path = self.receipts / f"tick-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json"
@@ -485,6 +494,7 @@ class Daemon:
                 max_workers=self._pool_slots, thread_name_prefix="admission"
             )
         slots = min(slots, self._pool_slots)
+        candidates = self._order_candidates(candidates, slots, state, summary)
         candidates = self._owned_candidates(candidates, slots, summary)
         if candidates:
             try:
@@ -566,6 +576,7 @@ class Daemon:
                     summary.pop("deferred", None)
                     more = self._discover(requested, changed, state, summary, skip=set(self.inflight), seen=seen,
                                           refill=True)
+                    more = self._order_candidates(more or [], slots, state, summary)
                     # a declared head whose read failed this tick is not read again until the next tick lists: until
                     # then no undeclared head is taken, so the declared lead the next tick instead of a whole backlog
                     declared = (summary.get("admission_priority") or {}).get("read") or []

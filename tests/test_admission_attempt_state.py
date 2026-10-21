@@ -162,6 +162,27 @@ class AttemptState(unittest.TestCase):
         self.assertEqual(sorted(received["admitted"]), [1, 2, 3, 4])
 
 
+class SnapshotDurability(unittest.TestCase):
+    def test_live_snapshots_do_not_wait_for_a_terminal_storage_flush(self):
+        from unittest.mock import patch
+        from svrf.admission_attempt import AdmissionAttempt
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("svrf.admission_attempt.os.fsync") as flush:
+                attempt = AdmissionAttempt(Path(temporary), 1, "h1", "c0")
+                self.assertTrue(attempt.path.is_file())
+                attempt.update(stage="command")
+                attempt.snapshot()
+                self.assertEqual(flush.call_count, 0,
+                                 "ordinary telemetry inserts storage barriers into a bounded tick")
+                answer = ({"verdict": "HELD", "residuals": ["check:original"]}, None, 0.1)
+                self.assertEqual(attempt.run(lambda: answer), answer)
+                self.assertGreater(flush.call_count, 0, "the original terminal is not durable")
+                after = flush.call_count
+                attempt.snapshot()
+                attempt.snapshot()
+                self.assertEqual(flush.call_count, after, "reading a terminal flushes it repeatedly")
+
+
 class CommandAttemptState(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

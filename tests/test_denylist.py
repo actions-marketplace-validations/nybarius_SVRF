@@ -50,6 +50,29 @@ class Denylist(unittest.TestCase):
             self.assertEqual(hits(f"see {term.upper()}s here"), [term])
         self.assertEqual(hits("take the p" + TERMS[5] + " into multiple" + TERMS[13] + "s"), [])
 
+    def test_stdlib_json_options_are_code_and_private_prose_still_refuses(self):
+        term = TERMS[13]
+        option = term + "s"
+        expressions = [
+            "import json\njson.dumps({}, " + option + "=(\",\", \":\"))",
+            "import json as wire\nwire.JSONEncoder(" + option + "=(\",\", \":\"))",
+            "from json import dumps as encode\nencode({}, " + option + "=(\",\", \":\"))",
+        ]
+        for source in expressions:
+            with self.subTest(source=source):
+                self.assertEqual(hits(source), [])
+                self.assertEqual(hits(source + "\n# private " + term), [term])
+                self.assertEqual(hits(source + "\nvalue = " + repr(term)), [term])
+        for source in [
+            "custom({}, " + option + "=(\",\", \":\"))",
+            "import fake as json\njson.dumps({}, " + option + "=(\",\", \":\"))",
+            "import json\njson = custom\njson.dumps({}, " + option + "=(\",\", \":\"))",
+            "import json\ndef run(json):\n    json.dumps({}, " + option + "=(\",\", \":\"))",
+            "import json\njson.dumps(" + repr(term) + ")",
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(hits(source), [term])
+
     def test_no_file_carries_a_denied_term(self):
         found = {}
         for path in files():

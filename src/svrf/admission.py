@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -86,17 +87,30 @@ def _read_basis(path: Path, head: str, base: str) -> list[dict] | None:
         raise ReadFailed("ADMISSION_READS_INVALID") from error
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
-    """Terminate the command's whole process group and reap it; a group already gone is fine."""
+def _stop_command(proc: subprocess.Popen) -> None:
+    """Ask the command's surviving owner to stop and reap its whole family."""
     import signal
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        proc.send_signal(signal.SIGTERM)
     except ProcessLookupError:
         pass
-    try:
-        proc.communicate(timeout=5)
-    except (subprocess.TimeoutExpired, ValueError):
-        proc.kill()
+    while True:
+        try:
+            proc.communicate(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
+            # A detached test can outlive its direct parent. Never kill the
+            # subreaper or release the slot while it still owns child processes.
+            if proc.poll() is not None:
+                # The owner has reaped its family; an outside pipe holder cannot
+                # keep a cancelled command's output read alive indefinitely.
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                return
+        except ValueError:
+            proc.wait()
+            return
 
 
 class Admission:
@@ -170,10 +184,12 @@ class Admission:
                "SVRF_ADMISSION_READS": str(reads)}
         if pr is not None:
             env["SVRF_PR"] = str(pr)
-        # The command runs in its own session: a timeout kills the whole process group (bash and
-        # the uv/python/pytest children it started), never bash alone with its children left
-        # running on the host to slow every later read into the same timeout.
-        proc = subprocess.Popen(["bash", "-c", self.command], cwd=str(root), env=env,
+        # A dedicated Linux subreaper owns this command, including test processes
+        # that detach into their own sessions or outlive a worker-thread parent.
+        # Its exit follows complete family reaping, so the original guards retain
+        # physical custody through both cancellation and command timeout.
+        supervisor = str(Path(__file__).with_name("_admission_process.py").resolve())
+        proc = subprocess.Popen([sys.executable, "-I", supervisor, self.command], cwd=str(root), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         deadline = time.monotonic() + self.timeout
         while True:
@@ -187,10 +203,10 @@ class Admission:
                 # can keep inherited pipes open after its parent exits. Completed
                 # output keeps its original result even if cancellation raced it.
                 if cancelled is not None and cancelled.is_set():
-                    _kill_group(proc)
+                    _stop_command(proc)
                     raise ReadFailed("ADMISSION_CANCELLED")
                 if time.monotonic() >= deadline:
-                    _kill_group(proc)
+                    _stop_command(proc)
                     raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:

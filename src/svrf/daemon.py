@@ -140,6 +140,7 @@ class Daemon:
             "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
             "inflight", "admission_seconds", "wall_seconds",
+            "admission_capacity", "admission_priority", "refill_stopped",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
@@ -426,10 +427,12 @@ class Daemon:
 
     def _write_tick_receipt(self, summary: dict) -> None:
         """What a landings-per-hour and an intake-time read consume: the tick's wall time, each admission's
-        duration, and what it landed."""
+        duration, what it landed, and the last scheduling observations in its summary."""
         row = {"schema_version": "svrf.tick/1", "at": summary["at"], "wall_seconds": summary.get("wall_seconds"),
                "admission_seconds": summary["admission_seconds"], "admitted": summary["admitted"],
                "merged": summary["merged"], "inflight": summary["inflight"], "receipts": summary["receipts"]}
+        row.update({key: summary[key] for key in
+                    ("admission_capacity", "admission_priority", "refill_stopped") if key in summary})
         self.receipts.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         path = self.receipts / f"tick-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json"

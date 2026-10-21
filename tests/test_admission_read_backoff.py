@@ -79,6 +79,15 @@ class ReadBackoff(unittest.TestCase):
         self.assertEqual(row.get("retry_at"), self.clock() + 30)
         return row
 
+    def test_python_reference_lifetimes_do_not_change_the_consumed_code_identity(self):
+        from svrf.admission_retry import source_identity
+        before = source_identity(self.read, 1, "h1", "c0")
+        constants = self.read.__call__.__code__.co_consts
+        after = source_identity(self.read, 1, "h1", "c0")
+        self.assertTrue(constants)
+        self.assertEqual(before["command_fingerprint"], after["command_fingerprint"],
+                         "a live reference was confused with a new command")
+
     def test_three_observed_failures_defer_before_a_slot_and_observation_does_not_slide(self):
         previous = self.fail_three()
         history = self.owner.load_state()["admission_history"]
@@ -134,8 +143,11 @@ class ReadBackoff(unittest.TestCase):
         ]
         for change in changes:
             with self.subTest(change=change):
-                while self.row_if_present().get("no_progress_failures", 0) < 3:
+                for _ in range(3):
+                    if self.row_if_present().get("no_progress_failures", 0) == 3:
+                        break
                     self.owner.tick()
+                self.assertEqual(self.row()["no_progress_failures"], 3)
                 original = self.row()["occurrence_key"]
                 before = self.read.calls
                 change()

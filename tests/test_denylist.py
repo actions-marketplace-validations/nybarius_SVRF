@@ -134,6 +134,19 @@ class Denylist(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(hits(source), [term])
 
+    def test_nested_import_exception_and_pattern_bindings_are_not_verified_json(self):
+        term = TERMS[13]
+        option = term + "s"
+        for source in [
+            "import json\ndef run():\n    import fake as json\n    json.dumps({}, " + option + "=(1, 2))",
+            "from json import dumps as encode\ndef run():\n    from fake import encode\n    encode({}, " + option + "=(1, 2))",
+            "import json\ntry: pass\nexcept Exception as json:\n    json.dumps({}, " + option + "=(1, 2))",
+            "import json\nmatch value:\n    case json:\n        json.dumps({}, " + option + "=(1, 2))",
+            "import json\nfrom fake import *\njson.dumps({}, " + option + "=(1, 2))",
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(hits(source), [term])
+
     def test_no_file_carries_a_denied_term(self):
         found = {}
         for path in files():

@@ -787,7 +787,8 @@ class Daemon:
                 self.repair(row, cls, lines, state, summary)
             else:
                 self.hold(row, hold["reason"], state, summary, failing=hold.get("failing") or [],
-                          paths=hold.get("paths") or [])
+                          paths=hold.get("paths") or [],
+                          extra={"gate": hold["gate"]} if "gate" in hold else None)
         for entry in receipt["retry_later"]:
             n = entry.get("number")
             if n is None:

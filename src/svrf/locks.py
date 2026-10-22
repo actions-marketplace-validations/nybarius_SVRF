@@ -13,6 +13,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .errors import check_stop
+
 _OWN_FDS: set[int] = set()
 
 
@@ -34,19 +36,26 @@ def _inherited(path: Path) -> bool:
 
 
 @contextmanager
-def flocked(path: Path | str, block: bool = False):
+def flocked(path: Path | str, block: bool = False, *, stop_requested=None):
     """An exclusive flock on `path`; yields whether it is held (always True when blocking)."""
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+", encoding="utf-8")
     _OWN_FDS.add(handle.fileno())
     try:
+        while True:
+            check_stop(stop_requested)
+            try:
+                flags = fcntl.LOCK_EX | (0 if block and stop_requested is None else fcntl.LOCK_NB)
+                fcntl.flock(handle, flags)
+                break
+            except BlockingIOError:
+                if not block or stop_requested is None:
+                    yield False
+                    return
+                time.sleep(0.25)
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
-        except BlockingIOError:
-            yield False
-            return
-        try:
+            check_stop(stop_requested)
             yield True
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
@@ -78,9 +87,10 @@ class SlotPool:
         self.held: dict[Path, object] = {}
         self.lock = threading.Lock()
 
-    def acquire(self, block: bool = True) -> Path | None:
+    def acquire(self, block: bool = True, *, stop_requested=None) -> Path | None:
         self.pool.mkdir(parents=True, exist_ok=True)
         while True:
+            check_stop(stop_requested)
             with self.lock:
                 for slot in self.slots:
                     if slot in self.held:

@@ -37,6 +37,7 @@ import os
 import subprocess
 import json
 import math
+import re
 import time
 from threading import Event
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -108,6 +109,7 @@ class Daemon:
         self.admission_round_reads = admission_round_reads
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
+        self._priority_heads: dict[int, str | None] = {}
         # Admission reads outlive a tick only when `tick_seconds` ends it: the pool and the live reads (number ->
         # future, row, base) persist, and the next tick's snapshot excludes those heads and collects them when done.
         self.tick_seconds = tick_seconds
@@ -237,6 +239,34 @@ class Daemon:
         """Stop taking new work; original futures remain owned until drained."""
         self._stop_requested = True
 
+    def _read_priorities(self, command: str) -> tuple[list[dict] | None, str | None]:
+        """Read PR-scoped numbers or exact-head NUMBER@40-lowercase-hex tokens."""
+        lines, failure = self._read_lines(command)
+        if lines is None:
+            return None, failure
+        entries = []
+        for line in lines:
+            bound = re.fullmatch(r"([0-9]+)@([0-9a-f]{40})", line)
+            try:
+                if bound:
+                    number = int(bound[1])
+                    if number <= 0:
+                        return None, "NOT_A_PRIORITY"
+                    entries.append({"number": number, "head": bound[2]})
+                elif line.isdigit():
+                    entries.append({"number": int(line)})
+                else:
+                    return None, "NOT_A_PRIORITY"
+            except ValueError:
+                return None, "NOT_A_PRIORITY"
+        return entries, None
+
+    def _priority_numbers(self, entries: list[dict]) -> list[int]:
+        """Project against the latest already-listed row, preserving declaration order."""
+        return [entry["number"] for entry in entries
+                if "head" not in entry
+                or self._priority_heads.get(entry["number"]) == entry["head"]]
+
     def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
             if not owned:
@@ -342,6 +372,8 @@ class Daemon:
             self.save(state, summary)
             return None
         by_number = {int(r["number"]): r for r in rows}
+        # Unlike round_rows, priority eligibility must forget heads absent from this snapshot.
+        self._priority_heads = {number: row.get("headRefOid") for number, row in by_number.items()}
         self._cancel_obsolete_admissions(by_number)
         self.round_rows.update(by_number)
         stacked_on = {r.get("baseRefName") for r in rows}
@@ -438,6 +470,11 @@ class Daemon:
 
     def _order_candidates(self, candidates: list[dict], slots: int, state: dict, summary: dict) -> list[dict]:
         """Order after observing capacity, before an unstarted head takes a free slot."""
+        # A smaller refill can reuse the command read, but never its old head projection.
+        # Keep the original tokens: a moved exact-head entry must not become PR-scoped.
+        priority = summary.get("admission_priority") or {}
+        if "entries" in priority:
+            priority["read"] = self._priority_numbers(priority["entries"])
         free = max(0, slots - len(self.inflight))
         if not free:
             return candidates  # no new read can start; the next discovery reads priority again
@@ -449,10 +486,14 @@ class Daemon:
             rank: dict[int, int] = {}
             if self.admission_priority_command:
                 # declared heads lead the backlog in their order; an unreadable declaration keeps the usual order
-                read, failure = self._read_numbers(self.admission_priority_command)
-                summary["admission_priority"] = ({"command": self.admission_priority_command, "read": read}
-                                                 if read is not None else
-                                                 {"command": self.admission_priority_command, "UNOBSERVED": failure})
+                entries, failure = self._read_priorities(self.admission_priority_command)
+                read = self._priority_numbers(entries) if entries is not None else None
+                priority = ({"command": self.admission_priority_command, "read": read}
+                            if read is not None else
+                            {"command": self.admission_priority_command, "UNOBSERVED": failure})
+                if entries is not None and any("head" in entry for entry in entries):
+                    priority["entries"] = entries
+                summary["admission_priority"] = priority
                 rank = {n: i for i, n in reversed(list(enumerate(read or [])))}
             if bounded:
                 # a bounded round reads the declared first, then whoever has waited longest (the older on a tie),

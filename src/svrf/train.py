@@ -38,6 +38,7 @@ run leaves its last state on disk.
 from __future__ import annotations
 
 import itertools
+import inspect
 import hashlib
 from copy import deepcopy
 import json
@@ -50,7 +51,7 @@ from typing import Callable
 
 from . import pr_surface
 from .admission_attempt import process_identity
-from .errors import RateLimited, ReadFailed
+from .errors import RateLimited, ReadFailed, StopRequested, check_stop
 from .rules import choose_families, chunk
 from .tree_provider import reason_class
 
@@ -334,6 +335,17 @@ class Train:
             self._surface_event(n, "QUEUED", batch=ident, members=family["prs"])
         return family
 
+    def _stop_arguments(self, operation) -> dict:
+        # Legacy injected gates/guards keep their original call contract.
+        try:
+            parameter = inspect.signature(operation).parameters.get("stop_requested")
+        except (TypeError, ValueError):
+            return {}
+        if parameter is not None and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            return {"stop_requested": self.stop_requested}
+        return {}
+
     def gate_family(self, family: dict, base: str) -> dict:
         """One gate of the family's folded tree, admitted by the memory guard."""
         for n in family["prs"]:
@@ -356,20 +368,27 @@ class Train:
         memory_seconds = 0.0
         memory_status = "skipped"
         try:
+            check_stop(self.stop_requested)
+            run = self.gate.run
+            arguments = self._stop_arguments(run)
             if self.memory is not None:
                 memory_status = "running"
                 memory_started = time.monotonic()
-                with self.memory.admit():
+                admit = self.memory.admit
+                with admit(**self._stop_arguments(admit)):
                     memory_seconds = round(time.monotonic() - memory_started, 3)
                     memory_status = "complete"
-                    result = self.gate.run(base, family["commit"], family["id"])
+                    check_stop(self.stop_requested)
+                    result = run(base, family["commit"], family["id"], **arguments)
             else:
-                result = self.gate.run(base, family["commit"], family["id"])
+                result = run(base, family["commit"], family["id"], **arguments)
         except Exception as error:  # a gate that could not run is retried, not red
+            postponed = isinstance(error, StopRequested)
             if memory_status == "running":
                 memory_seconds = round(time.monotonic() - memory_started, 3)
-                memory_status = "failed"
-            result = {"green": False, "read_failure": f"GATE_FAILED:{type(error).__name__}:{error}"}
+                memory_status = "postponed" if postponed else "failed"
+            reason = error.reason if postponed else f"GATE_FAILED:{type(error).__name__}:{error}"
+            result = {"green": False, "read_failure": reason}
             partial = getattr(error, "gate_phase_timing", None)
             if isinstance(partial, dict):
                 for name in ("phase_seconds", "phase_status", "prepare_phase_seconds", "prepare_phase_status"):
@@ -377,7 +396,7 @@ class Train:
                         result[name] = partial[name]
             else:
                 result["phase_status"] = {
-                    "gate_details": "not_started" if memory_status == "failed" else "unavailable"}
+                    "gate_details": "not_started" if postponed or memory_status == "failed" else "unavailable"}
         completed_event = self._event("gate_completed")
         result = dict(result)
         result["phase_seconds"] = {**result.get("phase_seconds", {}), "memory_wait": memory_seconds}

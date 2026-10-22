@@ -20,6 +20,18 @@ class ReadFailed(Exception):
         self.reason = reason
 
 
+class StopRequested(ReadFailed):
+    """An owner retired before a new operation began; leave it pending."""
+
+    def __init__(self):
+        super().__init__("STOP_REQUESTED")
+
+
+def check_stop(stop_requested) -> None:
+    if stop_requested is not None and stop_requested():
+        raise StopRequested()
+
+
 class RateLimited(ReadFailed):
     """GitHub refused the call for its rate limit; `reset` is when it said to come back."""
 

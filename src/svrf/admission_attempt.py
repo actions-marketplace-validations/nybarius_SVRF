@@ -187,6 +187,7 @@ class AdmissionAttempt:
         self._lock = RLock()
         self._finished = None
         self._terminal_saved = False
+        self._record_digest = None
         self._started = time.monotonic()
         root = Path(state_dir).resolve()
         attempt_id = uuid.uuid4().hex
@@ -203,9 +204,22 @@ class AdmissionAttempt:
         self.snapshot()  # Persist the source before an executor can start it.
 
     def _write(self, value: dict) -> None:
+        # The state snapshot owns its as-of clock. Rewrite the original record only
+        # when a source fact changes, including any changed or unread progress file.
+        facts = deepcopy(value)
+        for key in ("observed_at", "elapsed_seconds"):
+            facts.pop(key, None)
+        progress = facts.get("progress") or {}
+        progress.pop("observed_at", None)
+        summary = progress.get("summary") or {}
+        for key in ("observed_at", "elapsed_seconds", "stage_elapsed_seconds", "seconds_without_progress"):
+            summary.pop(key, None)
+        digest = _digest(facts)
+        sync = self._finished is not None and not self._terminal_saved
+        if digest == self._record_digest and not sync:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
-        sync = self._finished is not None and not self._terminal_saved
         try:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
                                              prefix="." + self.path.stem + "-", delete=False) as stream:
@@ -224,6 +238,7 @@ class AdmissionAttempt:
                 finally:
                     os.close(directory)
                 self._terminal_saved = True
+            self._record_digest = digest
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)

@@ -321,7 +321,7 @@ class CommandAttemptState(unittest.TestCase):
         result = owner.tick()
         if owner.inflight:
             owner.inflight[1]["future"].result(timeout=10)
-            result = owner.tick(drain=True)
+            result = owner.tick()
         self.assertEqual(result["retry_later"], [1])
         self.assertEqual(result["reasons"]["1"], "IO_POOL_CAPACITY")
         self.assertEqual(result["held"], [])

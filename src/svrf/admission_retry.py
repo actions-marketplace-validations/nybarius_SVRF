@@ -3,22 +3,72 @@ from __future__ import annotations
 
 import hashlib
 import marshal
+import math
 import os
 from pathlib import Path
+import re
 import sys
 
-from .admission_attempt import _digest
+from .admission_attempt import _canonical, _digest
+from .globs import PathSet
 
 
-def _callable_identity(value) -> dict:
+def _bound_value(value, depth=0):
+    """Encode supported captured values exactly; an opaque value has no guessed identity."""
+    if depth > 12:
+        raise ValueError("CAPTURE_DEPTH")
+    kind = type(value)
+    if value is None or kind in (bool, int, str):
+        return [kind.__name__, value]
+    if kind is float and math.isfinite(value):
+        return ["float", value.hex()]
+    if kind is bytes:
+        return ["bytes", value.hex()]
+    if kind in (list, tuple, set, frozenset):
+        rows = [_bound_value(item, depth + 1) for item in value]
+        return [kind.__name__, sorted(rows, key=_canonical) if kind in (set, frozenset) else rows]
+    if kind is dict:
+        rows = [[_bound_value(key, depth + 1), _bound_value(item, depth + 1)] for key, item in value.items()]
+        return ["dict", sorted(rows, key=_canonical)]
+    if kind is PathSet:
+        regex = value._regex
+        if regex is not None and type(regex) is not re.Pattern:
+            raise TypeError("MATCHER_UNOBSERVED")
+        return ["PathSet", _bound_value(value.patterns, depth + 1),
+                None if regex is None else [regex.pattern, regex.flags],
+                hashlib.sha256(marshal.dumps(PathSet.__call__.__code__, 2)).hexdigest()]
+    raise TypeError("CAPTURE_UNOBSERVED")
+
+
+def _callable_identity(value, *, bind_receiver=False) -> dict:
     method = value if hasattr(value, "__code__") else getattr(value, "__call__", None)
     code = getattr(method, "__code__", None)
-    # Format 2 records code values without reference-count-dependent sharing flags.
-    return {
+    result = {
         "module": getattr(value, "__module__", type(value).__module__),
         "name": getattr(value, "__qualname__", type(value).__qualname__),
+        # Format 2 records code values without reference-count-dependent sharing flags.
         "code": hashlib.sha256(marshal.dumps(code, 2)).hexdigest() if code is not None else None,
+        "bindings_status": "UNOBSERVED",
     }
+    if code is None:
+        return result
+    try:
+        captured = {
+            "defaults": _bound_value(getattr(method, "__defaults__", None)),
+            "keyword_defaults": _bound_value(getattr(method, "__kwdefaults__", None)),
+            "closure": {name: _bound_value(cell.cell_contents) for name, cell in
+                        zip(code.co_freevars, getattr(method, "__closure__", None) or (), strict=True)},
+        }
+        if bind_receiver:
+            receiver = getattr(value, "__self__", None)
+            if receiver is not None:
+                captured["receiver"] = _bound_value(receiver)
+            elif not hasattr(value, "__code__"):
+                captured["receiver"] = _bound_value(value)
+        result.update(bindings_status="OBSERVED", bindings_sha256=_digest(captured))
+    except (AttributeError, TypeError, ValueError, RecursionError):
+        pass
+    return result
 
 
 def source_identity(admission, pr: int, head: str, base: str, inputs: dict | None = None) -> dict:
@@ -30,7 +80,8 @@ def source_identity(admission, pr: int, head: str, base: str, inputs: dict | Non
         "order": getattr(admission, "order", None),
         "timeout": getattr(admission, "timeout", None),
         "refactor_prefixes": list(getattr(admission, "refactor_prefixes", ())),
-        "kind": _callable_identity(getattr(admission, "kind", None)),
+        "kind": (_callable_identity(admission.kind, bind_receiver=True)
+                 if getattr(admission, "kind", None) is not None else None),
         "root": str(getattr(getattr(admission, "git", None), "root", "")),
     }
     command = _digest(configuration)
@@ -45,7 +96,9 @@ def source_identity(admission, pr: int, head: str, base: str, inputs: dict | Non
         "python": sys.executable, "version": list(sys.version_info), "umask": mask,
     })
     watch = (inputs or {}).get("admission_watch")
-    observed = callback["code"] is not None and mask is not None
+    observed = (callback["code"] is not None and callback["bindings_status"] == "OBSERVED"
+                and mask is not None and (configuration["kind"] is None
+                                         or configuration["kind"]["bindings_status"] == "OBSERVED"))
     if watch is not None and isinstance(watch.get("value"), dict) and "unobserved" in watch["value"]:
         observed = False
     readset = {"pr": pr, "head": head, "base": base, "command": command,

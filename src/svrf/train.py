@@ -700,9 +700,9 @@ class Train:
                 cancelled = future is None or future.cancel()
                 if cancelled and self.stop_requested():
                     family["status"] = "REQUEUED"
-            # Retirement keeps ownership until every already-running gate has
-            # recorded its original result. Queued work never starts a new gate.
-            executor.shutdown(wait=self.stop_requested(), cancel_futures=True)
+            # Every running gate remains owned until its original result is
+            # recorded. A late stop may follow any earlier predicate sample.
+            executor.shutdown(wait=True, cancel_futures=True)
             self._save()
         return requeue
 

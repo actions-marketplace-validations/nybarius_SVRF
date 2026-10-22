@@ -226,6 +226,88 @@ class WatchStop(unittest.TestCase):
         self.assertEqual(receipt["pending"], [2, 3])
         self.assertEqual(gh.merged, [])
 
+    def test_late_stop_after_nonwaiting_shutdown_keeps_original_gate_owned(self):
+        repo = DaemonRepo([1, 2])
+        gh, gate = DaemonGitHub(repo), FakeGate(repo, bad=[1])
+        owner = daemon(repo, gh, gate, Admission(), self.root / "state",
+                       admission_jobs=2, train={"jobs": 2, "family_size": 1})
+        for row in gh.snapshot():
+            future = Future()
+            future.set_result(({"verdict": "MERGEABLE", "residuals": []}, None, 0.0))
+            owner.inflight[row["number"]] = {"future": future, "row": row, "base": "c0"}
+        second_entered, release_second = Event(), Event()
+        stopping, closed, early_close = Event(), Event(), Event()
+        waits, failures, pools = [], [], []
+        original_gate, original_close = gate.run, owner.close
+
+        class LateStopPool(ThreadPoolExecutor):
+            def shutdown(pool, wait=True, *, cancel_futures=False):
+                waits.append(wait)
+                pools.append(pool)
+                # Split the real executor shutdown at its cancellation/settlement
+                # boundary. The signal arrives after nonwaiting cancellation has
+                # returned, so a previously sampled false stop cannot be relied on.
+                result = super().shutdown(wait=False, cancel_futures=cancel_futures)
+                self.stop()
+                stopping.set()
+                if wait:
+                    return super().shutdown(wait=True)
+                return result
+
+        def controlled_gate(base, commit, label=""):
+            if label == "F1":
+                if not second_entered.wait(5):
+                    raise RuntimeError("second gate did not enter")
+            elif label == "F2":
+                second_entered.set()
+                if not release_second.wait(5):
+                    raise RuntimeError("second gate was not released")
+            return original_gate(base, commit, label)
+
+        def close():
+            if not release_second.is_set():
+                early_close.set()
+            closed.set()
+            return original_close()
+
+        def watch():
+            try:
+                self.watch(owner)
+            except BaseException as error:
+                failures.append(error)
+
+        gate.run, owner.close = controlled_gate, close
+        with patch("svrf.train.ThreadPoolExecutor", LateStopPool):
+            worker = Thread(target=watch)
+            worker.start()
+            try:
+                self.assertTrue(stopping.wait(5))
+                self.assertTrue(second_entered.is_set())
+                if waits == [False]:
+                    # Let the unsafe original path reach its actual close; no
+                    # scheduler-speed assumption is needed for the counterfactual.
+                    self.assertTrue(closed.wait(5))
+                self.assertFalse(closed.is_set())
+                paths = list((self.root / "state" / "receipts").glob("train-*.json"))
+                self.assertEqual(len(paths), 1)
+                self.assertIsNone(json.loads(paths[0].read_text())["finished"])
+            finally:
+                release_second.set()
+                worker.join(5)
+                for pool in pools:
+                    ThreadPoolExecutor.shutdown(pool, wait=True, cancel_futures=True)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(early_close.is_set())
+        self.assertTrue(closed.is_set())
+        receipt = json.loads(paths[0].read_text())
+        self.assertTrue(receipt["stop_requested"])
+        self.assertIsNotNone(receipt["finished"])
+        self.assertEqual(sorted(row["family"] for row in receipt["gates"]), ["F1", "F2"])
+        self.assertEqual(receipt["pending"], [2])
+        self.assertEqual(gh.merged, [])
+
+
 
 class TrainStop(unittest.TestCase):
     def setUp(self):

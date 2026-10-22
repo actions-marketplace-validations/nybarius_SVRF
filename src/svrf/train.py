@@ -647,14 +647,28 @@ class Train:
             return []
         if self.stop_requested():
             return [n for family in families for n in family["prs"]]
+        def read_family(family):
+            # A submitted future may still be queued when its owner retires.
+            if self.stop_requested():
+                family["status"] = "REQUEUED"
+                self._save()
+                return None
+            return self.gate_family(family, base)
+
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="gate")
-        futures = [executor.submit(self.gate_family, f, base) for f in families]
+        futures = []
+        for family in families:
+            futures.append(None if self.stop_requested() else executor.submit(read_family, family))
         requeue: list[int] = []
         expected = base
         try:
             for index, (family, future) in enumerate(zip(families, futures)):
                 later = [n for f in families[index + 1:] for n in f["prs"]]
-                gated = future.result()
+                gated = future.result() if future is not None else None
+                if gated is None:
+                    family["status"] = "REQUEUED"
+                    requeue.extend(family["prs"] + later)
+                    break
                 if self.dry_run:
                     family["status"] = "GATED_DRY" if gated.get("green") else "RED_DRY"
                     self._save()
@@ -682,9 +696,13 @@ class Train:
                 requeue.extend(later)
                 break
         finally:
-            for future in futures:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            for family, future in zip(families, futures):
+                cancelled = future is None or future.cancel()
+                if cancelled and self.stop_requested():
+                    family["status"] = "REQUEUED"
+            # Every running gate remains owned until its original result is
+            # recorded. A late stop may follow any earlier predicate sample.
+            executor.shutdown(wait=True, cancel_futures=True)
             self._save()
         return requeue
 

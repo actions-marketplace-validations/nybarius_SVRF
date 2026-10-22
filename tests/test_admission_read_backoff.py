@@ -69,8 +69,13 @@ class SourceBindings(unittest.TestCase):
     def test_defaults_and_supported_closure_values_are_consumed_configuration(self):
         def configured(value):
             return lambda path: value
+        def defaulted(value):
+            return lambda path, chosen=value: chosen
+        def keyword_defaulted(value):
+            return lambda path, *, chosen=value: chosen
         for kinds in ((configured("test"), configured("code")),
-                      (lambda path, value="test": value, lambda path, value="code": value)):
+                      (defaulted("test"), defaulted("code")),
+                      (keyword_defaulted("test"), keyword_defaulted("code"))):
             with self.subTest(kind=kinds[0]):
                 before, after = map(self.identity, kinds)
                 self.assertNotEqual(before["command_fingerprint"], after["command_fingerprint"])

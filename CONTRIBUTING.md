@@ -44,10 +44,11 @@ make demo     # just the local demo (no GitHub, no network)
   two still agree in meaning — that part is a human judgment call.
 - **Run `make check` locally** before opening the pull request. CI runs the same three
   jobs (Python tests, Lean proofs, container build) from `.github/workflows/ci.yml`.
-- **No project-specific vocabulary.** `tests/test_denylist.py` scans every file and every
-  commit message for a short list of terms from the private project this code was
-  originally extracted from. If that test fails on your change, you have probably copied
-  something from an internal note by mistake — reword it in plain engineering vocabulary.
+- **Keep current files independent.** `tests/test_denylist.py` scans current file contents
+  and paths for a short list of terms from the private project this code was originally
+  extracted from. Reword any copied internal text in plain engineering vocabulary.
+  Admission checks the current source and package. Historical commit messages and author
+  identities remain audit metadata and do not invalidate a verified current tree.
 - **Keep the README's claims supportable.** The "compared with other merge queues" table
   and the benchmark numbers should only ever say what is documented and reproducible
   (see `docs/BENCHMARK.md`); if you improve or re-run the benchmark, update the numbers

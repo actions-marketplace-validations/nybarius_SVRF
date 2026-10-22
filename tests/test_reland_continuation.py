@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -61,7 +62,11 @@ def pending(test, *, answer=None, two_heads=False, stop_train=False):
 
         def tick():
             try:
-                ticks.append(owner.tick())
+                deadline = time.monotonic() + 2
+                while True:
+                    ticks.append(owner.tick())
+                    if entered.is_set() or time.monotonic() >= deadline:
+                        break
             except BaseException as error:
                 errors.append(repr(error))
             finally:
@@ -92,7 +97,15 @@ def receive(test, case):
     owner = case["owner"]
     if 1 in owner.inflight:
         owner.inflight[1]["future"].result(timeout=1)
-        case["ticks"].append(owner.tick())
+        # The short first tick has already established a pending continuation.
+        # Receive both original outcomes in one bounded round: a new discovery
+        # round would have different once-per-round read obligations.
+        previous = owner.tick_seconds
+        try:
+            owner.tick_seconds = 1
+            case["ticks"].append(owner.tick())
+        finally:
+            owner.tick_seconds = previous
     return case["ticks"][-1]
 
 

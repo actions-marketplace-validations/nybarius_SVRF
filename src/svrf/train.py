@@ -38,6 +38,8 @@ run leaves its last state on disk.
 from __future__ import annotations
 
 import itertools
+import hashlib
+from copy import deepcopy
 import json
 import os
 import threading
@@ -47,6 +49,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import pr_surface
+from .admission_attempt import process_identity
 from .errors import RateLimited, ReadFailed
 from .rules import choose_families, chunk
 from .tree_provider import reason_class
@@ -68,8 +71,10 @@ class Train:
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
-                 hold_label: str = "train:hold", tree_provider=None):
+                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None):
         self.git, self.gh, self.gate = git, github, gate
+        self.on_receipt, self._projection_facts = on_receipt, None
+        self.event_owner = process_identity(os.getpid())
         self.jobs, self.memory = max(1, jobs), memory
         self.family_cap = max(1, family_cap)
         self.family_size = "adaptive" if family_size == "adaptive" else max(1, family_size)
@@ -115,9 +120,35 @@ class Train:
             self.receipt["api_calls"] = dict(getattr(self.gh, "calls", {}))
             self.receipt["surface"] = dict(self._surface_calls)
             self.receipt["stopped"] = self.stopped
+            self.receipt["observed_at"] = self.clock()
             tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.receipt, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
+            raw = (json.dumps(self.receipt, indent=1, sort_keys=True, default=str) + "\n").encode()
+            tmp.write_bytes(raw)
             tmp.replace(self.path)
+            if self.on_receipt is not None and self.receipt["gates"]:
+                facts = {"gates": self.receipt["gates"], "merges": self.receipt["merges"],
+                         "families": [{key: row.get(key) for key in ("id", "gate", "status")}
+                                      for row in self.receipt["families"]],
+                         "alerts": self.receipt["alerts"]}
+                if facts != self._projection_facts:
+                    try:
+                        self.on_receipt(self.receipt, self.path, hashlib.sha256(raw).hexdigest())
+                    except Exception as error:
+                        # A failed observation transport cannot change an original gate or merge.
+                        self.receipt["state_projection"] = {
+                            "status": "UNOBSERVED", "reason": type(error).__name__}
+                        try:
+                            tmp.write_text(json.dumps(self.receipt, indent=1, sort_keys=True, default=str) + "\n",
+                                           encoding="utf-8")
+                            tmp.replace(self.path)
+                        except OSError:
+                            pass
+                    else:
+                        self._projection_facts = deepcopy(facts)
+
+    def _event(self, kind: str) -> dict:
+        return {"kind": kind, "wall": self.clock(), "monotonic": time.monotonic(),
+                "clock": "unix+monotonic", "owner": dict(self.event_owner)}
 
     def _add(self, key: str, row: dict) -> None:
         with self.lock:
@@ -125,9 +156,11 @@ class Train:
         self._save()
 
     def hold(self, number: int, reason: str, paths=(), failing=(), *, batch: str | None = None,
-             gate_seconds: float | None = None, conflict_with: list[int] | None = None) -> None:
+             gate_seconds: float | None = None, conflict_with: list[int] | None = None,
+             gate: dict | None = None) -> None:
         paths, failing = list(paths), list(failing)
-        self._add("holds", {"number": number, "reason": reason, "paths": paths, "failing": failing})
+        self._add("holds", {"number": number, "reason": reason, "paths": paths, "failing": failing,
+                            **({"gate": gate} if gate is not None else {})})
         self._surface_event(number, "HELD", batch=batch, gate_seconds=gate_seconds, failing=failing,
                             conflict_with=conflict_with, conflict_paths=paths if conflict_with else None,
                             reason_line=self._reason_line(reason, paths, failing, conflict_with))
@@ -308,7 +341,9 @@ class Train:
         if known is not None:
             # a tree already gated red is never landed: reuse the red result
             row = {**self.receipt["gates"][known], "family": family["id"], "prs": family["prs"], "base": base,
-                   "commit": family["commit"], "reused": known, "seconds": 0.0}
+                   "commit": family["commit"], "reused": known, "seconds": 0.0,
+                   "phase_seconds": {}, "phase_status": {"gate": "reused"},
+                   "prepare_phase_seconds": {}, "prepare_phase_status": {}}
             with self.lock:
                 family["gate"] = len(self.receipt["gates"])
                 family["status"] = "RED"
@@ -316,15 +351,35 @@ class Train:
             return row
         started = self.clock()
         wall = time.monotonic()
+        memory_seconds = 0.0
+        memory_status = "skipped"
         try:
             if self.memory is not None:
+                memory_status = "running"
+                memory_started = time.monotonic()
                 with self.memory.admit():
+                    memory_seconds = round(time.monotonic() - memory_started, 3)
+                    memory_status = "complete"
                     result = self.gate.run(base, family["commit"], family["id"])
             else:
                 result = self.gate.run(base, family["commit"], family["id"])
         except Exception as error:  # a gate that could not run is retried, not red
+            if memory_status == "running":
+                memory_seconds = round(time.monotonic() - memory_started, 3)
+                memory_status = "failed"
             result = {"green": False, "read_failure": f"GATE_FAILED:{type(error).__name__}:{error}"}
+            partial = getattr(error, "gate_phase_timing", None)
+            if isinstance(partial, dict):
+                for name in ("phase_seconds", "phase_status", "prepare_phase_seconds", "prepare_phase_status"):
+                    if name in partial:
+                        result[name] = partial[name]
+            else:
+                result["phase_status"] = {
+                    "gate_details": "not_started" if memory_status == "failed" else "unavailable"}
+        completed_event = self._event("gate_completed")
         result = dict(result)
+        result["phase_seconds"] = {**result.get("phase_seconds", {}), "memory_wait": memory_seconds}
+        result["phase_status"] = {**result.get("phase_status", {}), "memory_wait": memory_status}
         if result.get("tree") not in (None, family["tree"]):
             result["green"] = False
             result.setdefault("failing", []).append(
@@ -332,6 +387,7 @@ class Train:
         row = {"family": family["id"], "prs": family["prs"], "base": base, "commit": family["commit"],
                "started": started, "seconds": round(time.monotonic() - wall, 3), **result}
         row["tree"] = family["tree"]
+        row["completed_event"] = completed_event
         with self.lock:
             family["gate"] = len(self.receipt["gates"])
             family["status"] = "GREEN" if row.get("green") else ("GATE_RETRY" if row.get("read_failure") else "RED")
@@ -394,25 +450,28 @@ class Train:
                 if pull.get("draft"):
                     self.call(self.gh.ready, n)
                 merged = self.call(self.gh.merge, n, prepared.commit)
+                acknowledged_event = self._event("merge_acknowledged")
             except ReadFailed as failure:
                 self.retry_later(n, failure.reason)
                 self._stop_family(family, index, "RETRY")
                 return False, rest
             row["head_sha"] = prepared.commit
+            merge_row = {"number": n, "family": family["id"], "gate": family["gate"],
+                         "head": prepared.commit, "merge": merged, "parents": [],
+                         "gated_tree": planned["tree"], "observed_tree": None, "identity": None,
+                         "at": self.clock(), **record, "acknowledged_event": acknowledged_event}
+            self._add("merges", merge_row)
             observed, parents, unread = self._read_landed(merged)
+            merge_row["at"] = self.clock()
             if observed is None:
                 # the merge happened and its tree could not be read: never a mismatch
                 self.retry_later(n, f"LANDED_TREE_UNREAD:{unread}")
-                self._add("merges", {"number": n, "family": family["id"], "head": prepared.commit, "merge": merged,
-                                     "parents": [], "gated_tree": planned["tree"], "observed_tree": None,
-                                     "identity": None, "at": self.clock(), **record})
                 family["status"] = "LANDED_TREE_UNREAD"
                 self._save()
                 return False, [s["number"] for s in steps[index + 1:]]
             identity = observed == planned["tree"]
-            self._add("merges", {"number": n, "family": family["id"], "head": prepared.commit, "merge": merged,
-                                 "parents": parents, "gated_tree": planned["tree"], "observed_tree": observed,
-                                 "identity": identity, "at": self.clock(), **record})
+            merge_row.update(parents=parents, observed_tree=observed, identity=identity)
+            self._save()
             if not identity:
                 self.alert("TREE_MISMATCH", family=family["id"], number=n, planned=planned["tree"],
                            observed=observed, merge=merged)
@@ -496,8 +555,18 @@ class Train:
         each half is replanned on the current base and gated, a green half lands and a red
         half is split again. Returns what to requeue."""
         if len(numbers) == 1:
+            # Refer to the original row, including its checker-owned evidence; failure text
+            # and the candidate's changed paths cannot reconstruct its consumed basis.
+            with self.lock:
+                index = next((i for i, row in enumerate(self.receipt["gates"]) if row is result), None)
+            gate = None
+            if index is not None:
+                gate = {"receipt": str(self.path.resolve()), "index": index,
+                        "row_sha256": hashlib.sha256(json.dumps(
+                            result, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest(),
+                        **{key: result.get(key) for key in ("base", "commit", "tree")}}
             self.hold(numbers[0], "GATE_RED", failing=list(result.get("failing") or [])[:12], batch=parent,
-                     gate_seconds=result.get("seconds"))
+                     gate_seconds=result.get("seconds"), gate=gate)
             return []
         half = len(numbers) // 2
         parts = self._attributed_split(numbers, result, parent) or (numbers[:half], numbers[half:])

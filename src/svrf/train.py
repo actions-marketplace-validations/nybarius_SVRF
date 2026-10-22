@@ -156,9 +156,11 @@ class Train:
         self._save()
 
     def hold(self, number: int, reason: str, paths=(), failing=(), *, batch: str | None = None,
-             gate_seconds: float | None = None, conflict_with: list[int] | None = None) -> None:
+             gate_seconds: float | None = None, conflict_with: list[int] | None = None,
+             gate: dict | None = None) -> None:
         paths, failing = list(paths), list(failing)
-        self._add("holds", {"number": number, "reason": reason, "paths": paths, "failing": failing})
+        self._add("holds", {"number": number, "reason": reason, "paths": paths, "failing": failing,
+                            **({"gate": gate} if gate is not None else {})})
         self._surface_event(number, "HELD", batch=batch, gate_seconds=gate_seconds, failing=failing,
                             conflict_with=conflict_with, conflict_paths=paths if conflict_with else None,
                             reason_line=self._reason_line(reason, paths, failing, conflict_with))
@@ -532,8 +534,18 @@ class Train:
         each half is replanned on the current base and gated, a green half lands and a red
         half is split again. Returns what to requeue."""
         if len(numbers) == 1:
+            # Refer to the original row, including its checker-owned evidence; failure text
+            # and the candidate's changed paths cannot reconstruct its consumed basis.
+            with self.lock:
+                index = next((i for i, row in enumerate(self.receipt["gates"]) if row is result), None)
+            gate = None
+            if index is not None:
+                gate = {"receipt": str(self.path.resolve()), "index": index,
+                        "row_sha256": hashlib.sha256(json.dumps(
+                            result, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest(),
+                        **{key: result.get(key) for key in ("base", "commit", "tree")}}
             self.hold(numbers[0], "GATE_RED", failing=list(result.get("failing") or [])[:12], batch=parent,
-                     gate_seconds=result.get("seconds"))
+                     gate_seconds=result.get("seconds"), gate=gate)
             return []
         half = len(numbers) // 2
         parts = self._attributed_split(numbers, result, parent) or (numbers[:half], numbers[half:])

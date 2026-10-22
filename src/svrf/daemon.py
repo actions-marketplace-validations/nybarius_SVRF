@@ -37,6 +37,7 @@ import os
 import subprocess
 import json
 import math
+import re
 import time
 from threading import Event
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -231,6 +232,31 @@ class Daemon:
         if not all(line.isdigit() for line in lines):
             return None, "NOT_A_NUMBER"
         return [int(line) for line in lines], None
+
+    def _read_priorities(self, command: str) -> tuple[list[dict] | None, str | None]:
+        """Read PR-scoped numbers or exact-head NUMBER@40-lowercase-hex tokens."""
+        lines, failure = self._read_lines(command)
+        if lines is None:
+            return None, failure
+        entries = []
+        for line in lines:
+            bound = re.fullmatch(r"([0-9]+)@([0-9a-f]{40})", line)
+            if bound and int(bound[1]) > 0:
+                entries.append({"number": int(bound[1]), "head": bound[2]})
+            elif line.isdigit():
+                try:
+                    entries.append({"number": int(line)})
+                except ValueError:
+                    return None, "NOT_A_PRIORITY"
+            else:
+                return None, "NOT_A_PRIORITY"
+        return entries, None
+
+    def _priority_numbers(self, entries: list[dict]) -> list[int]:
+        """Project against the latest already-listed row, preserving declaration order."""
+        return [entry["number"] for entry in entries
+                if "head" not in entry
+                or self.round_rows.get(entry["number"], {}).get("headRefOid") == entry["head"]]
 
     def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
@@ -433,6 +459,11 @@ class Daemon:
 
     def _order_candidates(self, candidates: list[dict], slots: int, state: dict, summary: dict) -> list[dict]:
         """Order after observing capacity, before an unstarted head takes a free slot."""
+        # A smaller refill can reuse the command read, but never its old head projection.
+        # Keep the original tokens: a moved exact-head entry must not become PR-scoped.
+        priority = summary.get("admission_priority") or {}
+        if "entries" in priority:
+            priority["read"] = self._priority_numbers(priority["entries"])
         free = max(0, slots - len(self.inflight))
         if not free:
             return candidates  # no new read can start; the next discovery reads priority again
@@ -444,10 +475,14 @@ class Daemon:
             rank: dict[int, int] = {}
             if self.admission_priority_command:
                 # declared heads lead the backlog in their order; an unreadable declaration keeps the usual order
-                read, failure = self._read_numbers(self.admission_priority_command)
-                summary["admission_priority"] = ({"command": self.admission_priority_command, "read": read}
-                                                 if read is not None else
-                                                 {"command": self.admission_priority_command, "UNOBSERVED": failure})
+                entries, failure = self._read_priorities(self.admission_priority_command)
+                read = self._priority_numbers(entries) if entries is not None else None
+                priority = ({"command": self.admission_priority_command, "read": read}
+                            if read is not None else
+                            {"command": self.admission_priority_command, "UNOBSERVED": failure})
+                if entries is not None and any("head" in entry for entry in entries):
+                    priority["entries"] = entries
+                summary["admission_priority"] = priority
                 rank = {n: i for i, n in reversed(list(enumerate(read or [])))}
             if bounded:
                 # a bounded round reads the declared first, then whoever has waited longest (the older on a tie),

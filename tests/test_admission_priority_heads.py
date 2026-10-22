@@ -8,6 +8,7 @@ an unreadable or malformed command does not remove candidates or skip admission.
 from __future__ import annotations
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -82,6 +83,17 @@ class HeadBoundPriority(unittest.TestCase):
                 self.assertEqual([row["number"] for row in got], [44, 43, 42, 41])
                 self.assertEqual(summary["admission_priority"]["UNOBSERVED"], "NOT_A_PRIORITY")
                 self.assertNotIn("read", summary["admission_priority"])
+
+    def test_overlong_bound_number_is_unobserved_and_keeps_normal_order(self):
+        previous_limit = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
+        sys.set_int_max_str_digits(640)
+        token = "9" * 641 + "@" + OLD
+        with patch.object(self.owner, "_read_lines", return_value=([token], None)):
+            summary = {}
+            got = self.owner._order_candidates(self.listed(), 1, {}, summary)
+        self.assertEqual([row["number"] for row in got], [44, 43, 42, 41])
+        self.assertEqual(summary["admission_priority"]["UNOBSERVED"], "NOT_A_PRIORITY")
 
     def test_mixed_bound_and_explicit_pr_scoped_entries_keep_order(self):
         with patch.object(self.owner, "_read_lines", return_value=([f"41@{OLD}", "43", f"42@{NEW}"], None)):

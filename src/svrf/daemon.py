@@ -241,14 +241,17 @@ class Daemon:
         entries = []
         for line in lines:
             bound = re.fullmatch(r"([0-9]+)@([0-9a-f]{40})", line)
-            if bound and int(bound[1]) > 0:
-                entries.append({"number": int(bound[1]), "head": bound[2]})
-            elif line.isdigit():
-                try:
+            try:
+                if bound:
+                    number = int(bound[1])
+                    if number <= 0:
+                        return None, "NOT_A_PRIORITY"
+                    entries.append({"number": number, "head": bound[2]})
+                elif line.isdigit():
                     entries.append({"number": int(line)})
-                except ValueError:
+                else:
                     return None, "NOT_A_PRIORITY"
-            else:
+            except ValueError:
                 return None, "NOT_A_PRIORITY"
         return entries, None
 

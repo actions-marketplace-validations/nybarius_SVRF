@@ -109,6 +109,7 @@ class Daemon:
         self.admission_round_reads = admission_round_reads
         self.demand = demand
         self.round_rows, self.round_inputs = {}, {}
+        self._priority_heads: dict[int, str | None] = {}
         # Admission reads outlive a tick only when `tick_seconds` ends it: the pool and the live reads (number ->
         # future, row, base) persist, and the next tick's snapshot excludes those heads and collects them when done.
         self.tick_seconds = tick_seconds
@@ -259,7 +260,7 @@ class Daemon:
         """Project against the latest already-listed row, preserving declaration order."""
         return [entry["number"] for entry in entries
                 if "head" not in entry
-                or self.round_rows.get(entry["number"], {}).get("headRefOid") == entry["head"]]
+                or self._priority_heads.get(entry["number"]) == entry["head"]]
 
     def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
@@ -366,6 +367,8 @@ class Daemon:
             self.save(state, summary)
             return None
         by_number = {int(r["number"]): r for r in rows}
+        # Unlike round_rows, priority eligibility must forget heads absent from this snapshot.
+        self._priority_heads = {number: row.get("headRefOid") for number, row in by_number.items()}
         self._cancel_obsolete_admissions(by_number)
         self.round_rows.update(by_number)
         stacked_on = {r.get("baseRefName") for r in rows}

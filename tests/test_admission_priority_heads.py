@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from fakes import Admission, Clock, DaemonGitHub, DaemonRepo, FakeGate, is_union
 from svrf.daemon import Daemon
+from svrf.errors import ReadFailed
 
 OLD = "a" * 40
 NEW = "b" * 40
@@ -39,9 +40,13 @@ class HeadBoundPriority(unittest.TestCase):
         )
         self.addCleanup(self.owner.close)
 
-    def listed(self):
+    def listed(self, missing_head=None):
         rows = self.gh.snapshot()
+        for row in rows:
+            if row["number"] == missing_head:
+                row.pop("headRefOid")
         self.owner.round_rows = {int(row["number"]): row for row in rows}
+        self.owner._priority_heads = {int(row["number"]): row.get("headRefOid") for row in rows}
         return rows
 
     def move_head(self):
@@ -67,8 +72,7 @@ class HeadBoundPriority(unittest.TestCase):
         self.assertEqual(out["admission_priority"]["entries"], [{"number": 41, "head": OLD}])
 
     def test_missing_snapshot_head_is_not_a_pr_scoped_fallback(self):
-        rows = self.listed()
-        rows[0].pop("headRefOid")
+        rows = self.listed(missing_head=41)
         summary = {}
         got = self.owner._order_candidates(rows, 1, {}, summary)
         self.assertEqual([row["number"] for row in got], [44, 43, 42, 41])
@@ -129,6 +133,32 @@ class HeadBoundPriority(unittest.TestCase):
         self.assertEqual(summary["admission_priority"]["entries"], [{"number": 41, "head": OLD}])
         self.assertEqual(command.call_count, 1)
         self.assertEqual(self.gh.calls, api_before)
+
+    def test_a_disappeared_declared_retry_does_not_stop_the_next_small_refill(self):
+        calls = []
+
+        def admission(head, base):
+            calls.append(head)
+            if head == OLD:
+                for number in (41, 43, 44):
+                    self.repo.heads.pop(number)
+                raise ReadFailed("ORIGINAL_DECLARED_RETRY")
+            return {"verdict": "MERGEABLE", "residuals": []}
+
+        self.owner.admission = admission
+        self.owner.admission_round_reads = 1
+        with patch.object(self.owner, "_read_lines", wraps=self.owner._read_lines) as command:
+            out = self.owner.tick()
+        self.assertEqual(calls, [OLD, "h42"])
+        self.assertIn(41, out["retry_later"])
+        self.assertEqual(out["admission_priority"]["read"], [])
+        self.assertEqual(out["admission_priority"]["entries"], [{"number": 41, "head": OLD}])
+        self.assertNotIn("refill_stopped", out)
+        self.assertIn(41, self.owner.round_rows)  # original inflight/source evidence remains
+        self.assertNotIn(41, self.owner._priority_heads)
+        self.assertEqual(command.call_count, 1)
+        self.assertEqual(self.gh.calls["graphql"], 2)
+        self.assertEqual(self.gh.merged, [42])
 
     def test_refill_preserves_duplicate_positions_and_explicit_legacy_scope(self):
         rows = self.listed()

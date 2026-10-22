@@ -114,6 +114,7 @@ class Daemon:
         self.inflight: dict[int, dict] = {}
         self._pending_attempt_history: dict[str, AdmissionAttempt] = {}
         self._pool, self._pool_slots = None, 1
+        self._stop_requested = False
 
     # ---- memory
 
@@ -232,11 +233,15 @@ class Daemon:
             return None, "NOT_A_NUMBER"
         return [int(line) for line in lines], None
 
+    def request_stop(self) -> None:
+        """Stop taking new work; original futures remain owned until drained."""
+        self._stop_requested = True
+
     def tick(self, *, drain: bool = False) -> dict:
         with owner_lock(self.lock_path) as owned:
             if not owned:
                 return {"tick": "LOCKED", "at": _stamp(self.clock)}
-            if drain:
+            if drain or self._stop_requested:
                 return self._drain()
             if self.demand is not None:
                 return self.demand.drain(self)
@@ -529,6 +534,8 @@ class Daemon:
 
     def _submit(self, rows: list[dict], base: str) -> None:
         for row in rows:
+            if self._stop_requested:
+                break
             n = int(row["number"])
             cancelled = Event() if isinstance(self.admission, Admission) else None
             source = source_identity(self.admission, n, row.get("headRefOid"), base,
@@ -571,7 +578,8 @@ class Daemon:
                "admission_seconds": summary["admission_seconds"], "admitted": summary["admitted"],
                "merged": summary["merged"], "inflight": summary["inflight"], "receipts": summary["receipts"]}
         row.update({key: summary[key] for key in
-                    ("admission_capacity", "admission_priority", "refill_stopped", "admission_cancelled") if key in summary})
+                    ("admission_capacity", "admission_priority", "refill_stopped", "admission_cancelled",
+                     "stop_requested") if key in summary})
         self.receipts.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         path = self.receipts / f"tick-{stamp}-{os.getpid()}-{next(_tick_serial):04d}.json"
@@ -650,16 +658,18 @@ class Daemon:
         deadline = started + self.tick_seconds if self.tick_seconds else None
         try:
             self._submit(candidates, base)
-            while self.inflight:
+            while self.inflight and not self._stop_requested:
                 pending = {item["future"]: n for n, item in self.inflight.items()}
                 timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
                 done, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
-                if not done:
-                    break  # the tick's time is spent: the reads still running cross into the next tick
+                if not done or self._stop_requested:
+                    break  # keep original reads for the next tick or the owner's drain
                 batch: list[int] = []
                 # Keep every result already available in the same group. Slow reads
                 # do not order other heads; the train still owns folding and landing.
                 for future in sorted(done, key=lambda f: pending[f]):
+                    if self._stop_requested:
+                        break
                     n = pending[future]
                     item = self.inflight.pop(n)
                     row, rbase = item["row"], item["base"]
@@ -677,8 +687,8 @@ class Daemon:
                     if self.admission_round_reads:
                         state.setdefault("waiting_since", {})[str(n)] = self.clock()
                     if "reland" in item:
-                        if summary["stopped"]:
-                            self._retry(summary, n, "TRAIN_STOPPED")
+                        if summary["stopped"] or self._stop_requested:
+                            self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
                         else:
                             self._finish_reland(item["reland"], row["headRefOid"], rbase,
                                                 value, failure, state, summary, revalidate=True)
@@ -695,8 +705,8 @@ class Daemon:
                     if decision == "ADMIT":
                         admitted.append(n)
                         batch.append(n)
-                    elif summary["stopped"]:
-                        self._retry(summary, n, "TRAIN_STOPPED")
+                    elif summary["stopped"] or self._stop_requested:
+                        self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
                     elif decision == "ALREADY_MERGED":
                         self.close_merged(row, rbase, state, summary)
                     elif decision == "REPAIR" and self.repair_enabled:
@@ -713,6 +723,7 @@ class Daemon:
                 # a slot freed by a finished read is refilled from the current snapshot's queue
                 # (only when the round was cut short: the list is read again when it left candidates unread)
                 if (summary.get("deferred") and slots - len(self.inflight) > 0 and not summary["stopped"]
+                        and not self._stop_requested
                         and (deadline is None or time.monotonic() < deadline)):
                     summary.pop("deferred", None)
                     more = self._discover(requested, changed, state, summary, skip=set(self.inflight), seen=seen,
@@ -746,6 +757,8 @@ class Daemon:
                         self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
                 self.save(state, summary)
         finally:
+            if self._stop_requested:
+                summary["stop_requested"] = True
             summary["inflight"] = sorted(self.inflight)
             if not self.inflight:
                 self._pool.shutdown(wait=False, cancel_futures=True)
@@ -760,7 +773,8 @@ class Daemon:
             self.save(state, summary)
         train = Train(self.git, self.gh, self.gate, receipts=self.receipts, clock=self.clock, sleep=self.sleep,
                       dry_run=self.dry_run, is_union=self.is_union, on_receipt=observed,
-                      **{**self.train_options, "hold_label": self.hold_label})
+                      **{**self.train_options, "hold_label": self.hold_label,
+                         "stop_requested": lambda: self._stop_requested})
         receipt = train.run(admitted, rows=rows)
         summary["receipt"] = str(train.path)
         summary["receipts"].append(str(train.path))
@@ -783,8 +797,11 @@ class Daemon:
             lines = [f"{rules.MERGE_CONFLICT}{p}" for p in hold.get("paths") or []] if hold["reason"] == "CONFLICT" else []
             cls = rules.repair_class(lines, self.is_union)
             if cls and self.repair_enabled:
-                repaired.add(n)
-                self.repair(row, cls, lines, state, summary)
+                if self._stop_requested:
+                    self._retry(summary, n, "STOP_REQUESTED")
+                else:
+                    repaired.add(n)
+                    self.repair(row, cls, lines, state, summary)
             else:
                 self.hold(row, hold["reason"], state, summary, failing=hold.get("failing") or [],
                           paths=hold.get("paths") or [],
@@ -798,7 +815,7 @@ class Daemon:
                 if n not in summary["merged_elsewhere"]:
                     summary["merged_elsewhere"].append(n)
             elif entry.get("reason") == "GITHUB_NOT_MERGEABLE" and n not in repaired and n in by_number \
-                    and self.repair_enabled:
+                    and self.repair_enabled and not self._stop_requested:
                 repaired.add(n)
                 self.repair(by_number[n], "STALE_BASE", ["github:NOT_MERGEABLE"], state, summary)
             elif n not in summary["merged"] and n not in repaired:

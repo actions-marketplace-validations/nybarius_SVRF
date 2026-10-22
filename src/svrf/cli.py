@@ -66,6 +66,7 @@ def _watch(daemon, config, *, path, interval=None, dry_run=False) -> int:
     def stop(signum, frame):
         nonlocal stopping
         stopping = True
+        daemon.request_stop()
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:

@@ -71,7 +71,8 @@ class Train:
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
-                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None):
+                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None,
+                 stop_requested: Callable[[], bool] = lambda: False):
         self.git, self.gh, self.gate = git, github, gate
         self.on_receipt, self._projection_facts = on_receipt, None
         self.event_owner = process_identity(os.getpid())
@@ -90,6 +91,7 @@ class Train:
         self.lock = threading.RLock()
         self.rows: dict[int, dict] = {}
         self.stopped = False
+        self.stop_requested = stop_requested
         self.red_trees: dict[str, int] = {}
         self._families = 0
         self._queue_position: dict[int, int] = {}
@@ -568,11 +570,13 @@ class Train:
             self.hold(numbers[0], "GATE_RED", failing=list(result.get("failing") or [])[:12], batch=parent,
                      gate_seconds=result.get("seconds"), gate=gate)
             return []
+        if self.stop_requested():
+            return list(numbers)  # retain the original red result; defer new bisection gates
         half = len(numbers) // 2
         parts = self._attributed_split(numbers, result, parent) or (numbers[:half], numbers[half:])
         requeue: list[int] = []
         for part in parts:
-            if self.stopped:
+            if self.stopped or self.stop_requested():
                 requeue.extend(part)
                 continue
             try:
@@ -583,6 +587,9 @@ class Train:
                 continue
             family = self.plan(part, base, parent=parent)
             if family is None:
+                continue
+            if self.stop_requested():
+                requeue.extend(family["prs"])
                 continue
             gated = self.gate_family(family, base)
             if gated.get("read_failure"):
@@ -638,6 +645,8 @@ class Train:
         self._add("rounds", {"base": base, "queue": list(queue), "families": [f["id"] for f in families]})
         if not families:
             return []
+        if self.stop_requested():
+            return [n for family in families for n in family["prs"]]
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="gate")
         futures = [executor.submit(self.gate_family, f, base) for f in families]
         requeue: list[int] = []
@@ -681,6 +690,9 @@ class Train:
 
     def run(self, numbers: list[int], rows: list[dict] | None = None) -> dict:
         self.receipt["requested"] = list(numbers)
+        if self.stop_requested():
+            self.receipt["pending"] = sorted(set(numbers))
+            return self._finish_run()
         try:
             queue = self.snapshot(list(numbers), rows)
             try:
@@ -702,16 +714,23 @@ class Train:
                                     reason_line=self._reason_line("CONFLICT", paths, [], partners))
             queue = chosen
             rounds = 0
-            while queue and not self.stopped and rounds < self.max_rounds:
+            while queue and not self.stopped and not self.stop_requested() and rounds < self.max_rounds:
                 rounds += 1
                 if rounds > 1:
                     queue = self.snapshot(queue)
+                if self.stop_requested():
+                    break
                 queue = self.round(queue)
                 if self.dry_run:
                     break
             self.receipt["pending"] = sorted(set(self.receipt["pending"]) | set(queue))
         except ReadFailed as failure:
             self.alert("RUN_UNREAD", reason=failure.reason)
+        return self._finish_run()
+
+    def _finish_run(self) -> dict:
+        # Operational retirement is separate from a tree-identity safety stop.
+        self.receipt["stop_requested"] = bool(self.stop_requested())
         self.receipt["finished"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         self._save()
         return self.receipt

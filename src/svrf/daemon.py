@@ -725,6 +725,13 @@ class Daemon:
         if digest is None:
             return None
         try:
+            payloads = held.get("payload_watch") or []
+            if held.get("watch_digest") is None:
+                if held.get("base_sha") is None:
+                    return None
+                # Recover the original basis before comparing a possibly changed base.
+                held["watch_digest"] = digest(held["base_sha"], held.get("watch") or [],
+                                              **({"payloads": payloads} if payloads else {}))
             if base_now["sha"] is None:
                 base_now["sha"] = self.git.main_sha()
             if base_now["sha"] == held.get("base_sha"):
@@ -732,7 +739,6 @@ class Daemon:
             if not base_now.get("fetched", True):
                 self.git.fetch([])
                 base_now["fetched"] = True
-            payloads = held.get("payload_watch") or []
             value = digest(base_now["sha"], held.get("watch") or [],
                            **({"payloads": payloads} if payloads else {}))
         except ReadFailed:
@@ -770,12 +776,14 @@ class Daemon:
         payloads = sorted(set(payloads))
         if not (paths or payloads) or base is None or digest is None:
             return {}
+        watch = {"watch": paths, "base_sha": base,
+                 **({"payload_watch": payloads} if payloads else {})}
         try:
-            value = digest(base, paths, **({"payloads": payloads} if payloads else {}))
-            return {"watch": paths, "base_sha": base, "watch_digest": value,
-                    **({"payload_watch": payloads} if payloads else {})}
+            watch["watch_digest"] = digest(base, paths,
+                                           **({"payloads": payloads} if payloads else {}))
         except ReadFailed:
-            return {}
+            return watch  # Keep the basis for a later read; no digest was observed.
+        return watch
 
     # ---- stacked pull requests
 

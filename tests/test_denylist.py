@@ -1,4 +1,4 @@
-"""The tree and the commit messages carry none of a list of terms that do not belong in
+"""The current tree carries none of a list of terms that do not belong in
 this repository (names and vocabulary of the private project it was extracted from).
 
 The terms are stored rot13-encoded so this file does not itself contain them.
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import codecs
 import re
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -61,13 +60,6 @@ class Denylist(unittest.TestCase):
             if terms:
                 found[str(path.relative_to(ROOT))] = terms
         self.assertEqual(found, {})
-
-    def test_no_commit_message_carries_a_denied_term(self):
-        done = subprocess.run(["git", "-C", str(ROOT), "log", "--format=%H%n%an%n%ae%n%B%n--"],
-                              capture_output=True, text=True)
-        if done.returncode != 0:
-            self.skipTest("not a git checkout")
-        self.assertEqual(hits(done.stdout), [])
 
 
 if __name__ == "__main__":

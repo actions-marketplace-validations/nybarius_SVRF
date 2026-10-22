@@ -80,6 +80,9 @@ def exercise(tmp_path, changes, *, busy=2, stop=False):
                     self.inflight = {}
             return {'tick': 'RAN', 'inflight': list(self.inflight)}
 
+        def request_stop(self):
+            pass
+
         def close(self):
             assert not self.inflight
             self.closed = True

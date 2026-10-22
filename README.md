@@ -367,6 +367,26 @@ in [docs/RELEASING.md](docs/RELEASING.md).
 Help getting SVRF running on your repositories, or questions about commercial use:
 inquiries to **nybarius@gmail.com**.
 
+## Exact-head admission priority
+
+An optional `[admission] priority_command` emits one priority per nonempty line,
+in preferred order. A decimal PR number retains the legacy, explicitly PR-scoped
+meaning. `NUMBER@HEAD` binds priority to one positive PR number and one exact
+40-character lowercase hexadecimal head. For example,
+`41@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` prioritizes only that head of PR 41.
+
+Head-bound entries are compared with the head in the existing pull-request list
+snapshot; they cause no additional GitHub reads. A pushed or missing head receives
+the normal queue ranking. The original typed entries remain in the receipt while
+a smaller refill recomputes their eligible numbers from its updated snapshot.
+Malformed output or a failed command is recorded as unobserved and keeps the
+normal ranking. Priority never skips admission, gating, or merge checks.
+
+The command owner must omit expired declarations. Deploy a head-aware reader
+before enabling typed output. Older readers reject typed lines and keep normal
+ranking; they must not be fed a stripped PR-only projection of exact-head authority.
+
+
 ## License
 
 [PolyForm Shield 1.0.0](LICENSE): free to use, modify and redistribute, including inside a

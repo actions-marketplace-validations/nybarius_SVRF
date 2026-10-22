@@ -38,6 +38,7 @@ run leaves its last state on disk.
 from __future__ import annotations
 
 import itertools
+import inspect
 import hashlib
 from copy import deepcopy
 import json
@@ -50,7 +51,7 @@ from typing import Callable
 
 from . import pr_surface
 from .admission_attempt import process_identity
-from .errors import RateLimited, ReadFailed
+from .errors import RateLimited, ReadFailed, StopRequested, check_stop
 from .rules import choose_families, chunk
 from .tree_provider import reason_class
 
@@ -71,7 +72,8 @@ class Train:
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
-                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None):
+                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None,
+                 stop_requested: Callable[[], bool] = lambda: False):
         self.git, self.gh, self.gate = git, github, gate
         self.on_receipt, self._projection_facts = on_receipt, None
         self.event_owner = process_identity(os.getpid())
@@ -90,6 +92,7 @@ class Train:
         self.lock = threading.RLock()
         self.rows: dict[int, dict] = {}
         self.stopped = False
+        self.stop_requested = stop_requested
         self.red_trees: dict[str, int] = {}
         self._families = 0
         self._queue_position: dict[int, int] = {}
@@ -332,6 +335,17 @@ class Train:
             self._surface_event(n, "QUEUED", batch=ident, members=family["prs"])
         return family
 
+    def _stop_arguments(self, operation) -> dict:
+        # Legacy injected gates/guards keep their original call contract.
+        try:
+            parameter = inspect.signature(operation).parameters.get("stop_requested")
+        except (TypeError, ValueError):
+            return {}
+        if parameter is not None and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            return {"stop_requested": self.stop_requested}
+        return {}
+
     def gate_family(self, family: dict, base: str) -> dict:
         """One gate of the family's folded tree, admitted by the memory guard."""
         for n in family["prs"]:
@@ -354,20 +368,27 @@ class Train:
         memory_seconds = 0.0
         memory_status = "skipped"
         try:
+            check_stop(self.stop_requested)
+            run = self.gate.run
+            arguments = self._stop_arguments(run)
             if self.memory is not None:
                 memory_status = "running"
                 memory_started = time.monotonic()
-                with self.memory.admit():
+                admit = self.memory.admit
+                with admit(**self._stop_arguments(admit)):
                     memory_seconds = round(time.monotonic() - memory_started, 3)
                     memory_status = "complete"
-                    result = self.gate.run(base, family["commit"], family["id"])
+                    check_stop(self.stop_requested)
+                    result = run(base, family["commit"], family["id"], **arguments)
             else:
-                result = self.gate.run(base, family["commit"], family["id"])
+                result = run(base, family["commit"], family["id"], **arguments)
         except Exception as error:  # a gate that could not run is retried, not red
+            postponed = isinstance(error, StopRequested)
             if memory_status == "running":
                 memory_seconds = round(time.monotonic() - memory_started, 3)
-                memory_status = "failed"
-            result = {"green": False, "read_failure": f"GATE_FAILED:{type(error).__name__}:{error}"}
+                memory_status = "postponed" if postponed else "failed"
+            reason = error.reason if postponed else f"GATE_FAILED:{type(error).__name__}:{error}"
+            result = {"green": False, "read_failure": reason}
             partial = getattr(error, "gate_phase_timing", None)
             if isinstance(partial, dict):
                 for name in ("phase_seconds", "phase_status", "prepare_phase_seconds", "prepare_phase_status"):
@@ -375,7 +396,7 @@ class Train:
                         result[name] = partial[name]
             else:
                 result["phase_status"] = {
-                    "gate_details": "not_started" if memory_status == "failed" else "unavailable"}
+                    "gate_details": "not_started" if postponed or memory_status == "failed" else "unavailable"}
         completed_event = self._event("gate_completed")
         result = dict(result)
         result["phase_seconds"] = {**result.get("phase_seconds", {}), "memory_wait": memory_seconds}
@@ -568,11 +589,13 @@ class Train:
             self.hold(numbers[0], "GATE_RED", failing=list(result.get("failing") or [])[:12], batch=parent,
                      gate_seconds=result.get("seconds"), gate=gate)
             return []
+        if self.stop_requested():
+            return list(numbers)  # retain the original red result; defer new bisection gates
         half = len(numbers) // 2
         parts = self._attributed_split(numbers, result, parent) or (numbers[:half], numbers[half:])
         requeue: list[int] = []
         for part in parts:
-            if self.stopped:
+            if self.stopped or self.stop_requested():
                 requeue.extend(part)
                 continue
             try:
@@ -583,6 +606,9 @@ class Train:
                 continue
             family = self.plan(part, base, parent=parent)
             if family is None:
+                continue
+            if self.stop_requested():
+                requeue.extend(family["prs"])
                 continue
             gated = self.gate_family(family, base)
             if gated.get("read_failure"):
@@ -638,14 +664,30 @@ class Train:
         self._add("rounds", {"base": base, "queue": list(queue), "families": [f["id"] for f in families]})
         if not families:
             return []
+        if self.stop_requested():
+            return [n for family in families for n in family["prs"]]
+        def read_family(family):
+            # A submitted future may still be queued when its owner retires.
+            if self.stop_requested():
+                family["status"] = "REQUEUED"
+                self._save()
+                return None
+            return self.gate_family(family, base)
+
         executor = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="gate")
-        futures = [executor.submit(self.gate_family, f, base) for f in families]
+        futures = []
+        for family in families:
+            futures.append(None if self.stop_requested() else executor.submit(read_family, family))
         requeue: list[int] = []
         expected = base
         try:
             for index, (family, future) in enumerate(zip(families, futures)):
                 later = [n for f in families[index + 1:] for n in f["prs"]]
-                gated = future.result()
+                gated = future.result() if future is not None else None
+                if gated is None:
+                    family["status"] = "REQUEUED"
+                    requeue.extend(family["prs"] + later)
+                    break
                 if self.dry_run:
                     family["status"] = "GATED_DRY" if gated.get("green") else "RED_DRY"
                     self._save()
@@ -673,14 +715,21 @@ class Train:
                 requeue.extend(later)
                 break
         finally:
-            for future in futures:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            for family, future in zip(families, futures):
+                cancelled = future is None or future.cancel()
+                if cancelled and self.stop_requested():
+                    family["status"] = "REQUEUED"
+            # Every running gate remains owned until its original result is
+            # recorded. A late stop may follow any earlier predicate sample.
+            executor.shutdown(wait=True, cancel_futures=True)
             self._save()
         return requeue
 
     def run(self, numbers: list[int], rows: list[dict] | None = None) -> dict:
         self.receipt["requested"] = list(numbers)
+        if self.stop_requested():
+            self.receipt["pending"] = sorted(set(numbers))
+            return self._finish_run()
         try:
             queue = self.snapshot(list(numbers), rows)
             try:
@@ -702,16 +751,23 @@ class Train:
                                     reason_line=self._reason_line("CONFLICT", paths, [], partners))
             queue = chosen
             rounds = 0
-            while queue and not self.stopped and rounds < self.max_rounds:
+            while queue and not self.stopped and not self.stop_requested() and rounds < self.max_rounds:
                 rounds += 1
                 if rounds > 1:
                     queue = self.snapshot(queue)
+                if self.stop_requested():
+                    break
                 queue = self.round(queue)
                 if self.dry_run:
                     break
             self.receipt["pending"] = sorted(set(self.receipt["pending"]) | set(queue))
         except ReadFailed as failure:
             self.alert("RUN_UNREAD", reason=failure.reason)
+        return self._finish_run()
+
+    def _finish_run(self) -> dict:
+        # Operational retirement is separate from a tree-identity safety stop.
+        self.receipt["stop_requested"] = bool(self.stop_requested())
         self.receipt["finished"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.clock()))
         self._save()
         return self.receipt

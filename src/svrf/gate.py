@@ -28,6 +28,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from .errors import StopRequested, check_stop
 from .locks import SlotPool, flocked
 from .redact import redact
 from .rules import gate_infra_failure
@@ -52,8 +53,8 @@ def _phase(seconds: dict, status: dict, name: str):
     status[name] = "running"
     try:
         yield
-    except BaseException:
-        status[name] = "failed"
+    except BaseException as error:
+        status[name] = "postponed" if isinstance(error, StopRequested) else "failed"
         raise
     else:
         status[name] = "complete"
@@ -76,14 +77,16 @@ class MemoryGuard:
         return self.available_gb() - self.need_gb * running >= self.need_gb + self.reserve_gb
 
     @contextmanager
-    def admit(self):
+    def admit(self, *, stop_requested=None):
         while True:
+            check_stop(stop_requested)
             with self.lock:
                 if self.fits(self.running):
                     self.running += 1
                     break
             self.sleep(self.poll)
         try:
+            check_stop(stop_requested)
             yield
         finally:
             with self.lock:
@@ -153,7 +156,7 @@ class CommandGate:
         log.write_text(text, encoding="utf-8")  # the log on disk is redacted too, not only what we return
         return rc, text, round(time.monotonic() - started, 3)
 
-    def run(self, base: str, commit: str, label: str = "") -> dict:
+    def run(self, base: str, commit: str, label: str = "", *, stop_requested=None) -> dict:
         # Preparation details are a breakdown of worktree_prepare, not extra time.
         # Absent seconds with not_started/skipped status are never observed zero waits.
         timing = {
@@ -166,17 +169,26 @@ class CommandGate:
                                      ("worktree_create", "index_flags", "checkout", "clean")},
         }
         seconds, status = timing["phase_seconds"], timing["phase_status"]
+        command_started = False
+
+        def before_command():
+            if not command_started:
+                check_stop(stop_requested)
+
         if not self.setup:
             status.update(setup_lock_wait="skipped", setup_commands="skipped")
         if not self.commands:
             status["gate_commands"] = "skipped"
         try:
             with _phase(seconds, status, "slot_wait"):
-                slot = self.slots.acquire()
+                options = {"stop_requested": stop_requested} if stop_requested is not None else {}
+                slot = self.slots.acquire(**options)
             try:
+                check_stop(stop_requested)
                 with _phase(seconds, status, "worktree_prepare"):
                     self._prepare(slot, commit, phase_seconds=timing["prepare_phase_seconds"],
                                   phase_status=timing["prepare_phase_status"])
+                check_stop(stop_requested)
                 with _phase(seconds, status, "metadata"):
                     tree = self._git("rev-parse", "HEAD^{tree}", cwd=slot)
                     logs = self.logs / f"{label or 'gate'}-{commit[:12]}"
@@ -190,14 +202,21 @@ class CommandGate:
                           "logs": str(logs), "steps": steps, "failing": [], **timing}
                 plan = [("setup", c) for c in self.setup] + [("gate", c) for c in self.commands]
                 for index, (phase, command) in enumerate(plan):
+                    before_command()
                     log = logs / f"{index:02d}-{phase}.log"
                     if phase == "setup":
                         with ExitStack() as acquired:
                             with _phase(seconds, status, "setup_lock_wait"):
-                                acquired.enter_context(flocked(self.setup_lock, block=True))
+                                options = ({"stop_requested": stop_requested}
+                                           if not command_started and stop_requested is not None else {})
+                                acquired.enter_context(flocked(self.setup_lock, block=True, **options))
+                            before_command()
+                            command_started = True
                             with _phase(seconds, status, "setup_commands"):
                                 rc, text, elapsed = self._step(command, slot, log, env)
                     else:
+                        before_command()
+                        command_started = True
                         with _phase(seconds, status, "gate_commands"):
                             rc, text, elapsed = self._step(command, slot, log, env)
                     lines = [ANSI.sub("", line) for line in text.splitlines()]

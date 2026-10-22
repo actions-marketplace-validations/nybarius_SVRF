@@ -5,11 +5,14 @@ repository/gate. No native admission or publication condition is replaced.
 """
 
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fakes import DaemonGitHub, DaemonRepo, FakeGate
 from test_daemon import daemon
@@ -17,7 +20,13 @@ from test_daemon import daemon
 
 class RebuiltAdmissionProgress(unittest.TestCase):
     def test_ready_head_lands_while_rebuilt_admission_is_still_pending(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        # Keep real attempt files/state and isolate terminal disk-flush latency.
+        # SnapshotDurability checks that barrier separately. This module-local
+        # os view leaves os.fsync unchanged for every other module.
+        attempt_os = SimpleNamespace(**vars(os))
+        attempt_os.fsync = lambda _fd: None
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("svrf.admission_attempt.os", attempt_os):
             repo = DaemonRepo([1, 2])
             gh = DaemonGitHub(repo)
             rebuilt_entered = threading.Event()
@@ -50,8 +59,9 @@ class RebuiltAdmissionProgress(unittest.TestCase):
                     ready_returned.set()
                     return {"verdict": "MERGEABLE", "residuals": []}
                 rebuilt_entered.set()
-                if not release_rebuilt.wait(5):
-                    raise RuntimeError("test did not release the original rebuilt read")
+                # Only explicit cleanup may release this read; an internal timeout
+                # must not turn a blocked landing into apparent independent progress.
+                release_rebuilt.wait()
                 return {"verdict": "MERGEABLE", "residuals": []}
 
             owner = daemon(repo, gh, FakeGate(repo), admission, Path(temporary),
@@ -74,7 +84,8 @@ class RebuiltAdmissionProgress(unittest.TestCase):
                 ready_future = owner.inflight.get(2, {}).get("future")
                 if ready_future is not None:
                     self.assertEqual(ready_future.result(timeout=1)[0]["verdict"], "MERGEABLE")
-                landed = ready_landed.wait(0.5)
+                # Bound a real deadlock without imposing a host scheduling deadline.
+                landed = ready_landed.wait(5)
                 observed = {
                     "schema": "svrf-reland-progress-observation/1",
                     "upstream_commit": "d5ef9cbd81b5d85763f010b63a86c6704eb47c0f",
@@ -92,6 +103,7 @@ class RebuiltAdmissionProgress(unittest.TestCase):
                         or [comment for comment in gh.comments if comment[0] == 1]),
                 }
                 self.assertEqual(errors, [])
+                self.assertTrue(observed["rebuilt_read_pending"])
                 self.assertFalse(observed["published_before_rebuilt_acceptance"])
                 self.assertTrue(
                     landed,

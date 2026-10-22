@@ -45,6 +45,9 @@ from typing import Callable
 
 from . import rules
 from .admission import Admission
+from .admission_attempt import AdmissionAttempt
+from .admission_retry import retain_failure, source_identity
+from .train_events import project_receipt
 from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
 from .train import Train
@@ -109,6 +112,7 @@ class Daemon:
         # future, row, base) persist, and the next tick's snapshot excludes those heads and collects them when done.
         self.tick_seconds = tick_seconds
         self.inflight: dict[int, dict] = {}
+        self._pending_attempt_history: dict[str, AdmissionAttempt] = {}
         self._pool, self._pool_slots = None, 1
 
     # ---- memory
@@ -135,19 +139,50 @@ class Daemon:
         tmp.replace(path)
 
     def save(self, state: dict, summary: dict) -> None:
+        # Discovery can stop before its normal completion path. The live owner,
+        # rather than an initialized tick summary, always determines occupancy.
+        summary["observed_at"] = self.clock()
+        summary["inflight"] = sorted(self.inflight)
+        summary["admission_attempts"] = {
+            str(n): {**item["attempt"].snapshot(), "future_done": item["future"].done()}
+            for n, item in self.inflight.items() if item.get("attempt") is not None
+        }
+        history = state.setdefault("admission_history", {})
+        received = []
+        for attempt_id, attempt in self._pending_attempt_history.items():
+            value = next((row for row in summary["admission_attempts"].values()
+                          if row["attempt_id"] == attempt_id), None)
+            value = value if value is not None else attempt.snapshot()
+            if value.get("finished_at") is not None:
+                if attempt_id not in history:
+                    retain_failure(state, value)
+                    history[attempt_id] = value
+                received.append(attempt_id)
+        # The state is a bounded index. Every older original record remains on disk.
+        recent = sorted(history, key=lambda key: (
+            history[key].get("terminal_at", 0), history[key].get("started_monotonic", 0), key))[-32:]
+        state["admission_history"] = {key: history[key] for key in recent}
         if self.dry_run:
+            for attempt_id in received:
+                self._pending_attempt_history.pop(attempt_id, None)
             return
         state["last_tick"] = {k: summary[k] for k in (
-            "tick", "at", "receipt", "receipts", "stopped", "reason", "retry_at",
+            "tick", "at", "observed_at", "receipt", "receipts", "stopped", "reason", "retry_at",
             "admitted", "held", "merged", "skipped", "retry_later", "reasons", "tree_provider", "deferred",
-            "inflight", "admission_seconds", "wall_seconds",
-            "admission_capacity", "admission_priority", "refill_stopped", "admission_cancelled",
+            "inflight", "admission_attempts", "admission_seconds", "wall_seconds",
+            "admission_capacity", "admission_priority", "admission_backoff", "refill_stopped", "admission_cancelled",
         ) if k in summary}
         state["last_tick"]["admission_sources"] = {
             str(n): {"head": inputs["row"].get("headRefOid"), "base": inputs["admission_base"]}
             for n, inputs in self.round_inputs.items() if "admission_base" in inputs
         }
+        state["last_tick"]["admission_sources"].update({
+            str(n): {"head": item["row"].get("headRefOid"), "base": item["base"]}
+            for n, item in self.inflight.items()
+        })
         self._write(self.state_path, state)
+        for attempt_id in received:
+            self._pending_attempt_history.pop(attempt_id, None)
         rows = [{"number": int(n), **entry} for n, entry in sorted(state["held"].items(), key=lambda kv: int(kv[0]))]
         self._write(self.state_dir / "held.json", {"schema_version": HELD_SCHEMA, "generated": summary["at"],
                                                    "held": rows})
@@ -305,7 +340,8 @@ class Daemon:
         self._cancel_obsolete_admissions(by_number)
         self.round_rows.update(by_number)
         stacked_on = {r.get("baseRefName") for r in rows}
-        for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"]):
+        for memory in (state["held"], state["bases"], state["merged_elsewhere"], state["relanded"],
+                       state.setdefault("admission_retries", {})):
             for n in [n for n in memory if int(n) not in by_number]:
                 if memory is state["relanded"] and memory[n].get("from_ref") in stacked_on:
                     continue  # a pull request still stacked on the re-landed branch reads this record
@@ -353,7 +389,47 @@ class Daemon:
             for n in current:
                 waiting.setdefault(n, self.clock())
             state["waiting_since"] = waiting
-        return candidates
+        return self._defer_reads(candidates, state, summary, refill=refill)
+
+    def _defer_reads(self, candidates: list[dict], state: dict, summary: dict, *, refill=False):
+        retries = state.get("admission_retries") or {}
+        now = self.clock()
+        checking = [row for row in candidates
+                    if (retries.get(str(row["number"])) or {}).get("retry_at", 0) is not None
+                    and (retries.get(str(row["number"])) or {}).get("retry_at", 0) > now]
+        if not checking:
+            return candidates
+        try:
+            base = self._stage(checking)  # A cached base cannot extend a source-bound delay.
+        except ReadFailed as failure:
+            if refill:
+                return []
+            summary.update(tick="RETRY", reason=failure.reason)
+            self.save(state, summary)
+            return None
+        deferred = set()
+        for row in checking:
+            number = int(row["number"])
+            previous = retries[str(number)]
+            source = source_identity(self.admission, number, row.get("headRefOid"), base,
+                                     self.round_inputs.get(number))
+            if (source["source_status"] == "OBSERVED"
+                    and source["occurrence_key"] == previous.get("occurrence_key")
+                    and previous.get("backoff_kind") in ("NO_USEFUL_PROGRESS", "REPEATED_UNOBSERVED")):
+                deferred.add(number)
+                reason = ("REPEATED_UNOBSERVED_BACKOFF" if previous["backoff_kind"] == "REPEATED_UNOBSERVED"
+                          else "READ_FAILURE_BACKOFF")
+                summary.setdefault("admission_backoff", {})[str(number)] = {
+                    **previous, "reason": reason, "original_reason": previous.get("reason"),
+                }
+                self._retry(summary, number, reason)
+            else:
+                retries.pop(str(number), None)
+        if deferred:
+            summary["deferred"] = sorted(set(summary.get("deferred") or []) | deferred)
+            if len(deferred) == len(candidates) and not self.inflight:
+                summary["tick"] = "BACKOFF"
+        return [row for row in candidates if int(row["number"]) not in deferred]
 
     def _order_candidates(self, candidates: list[dict], slots: int, state: dict, summary: dict) -> list[dict]:
         """Order after observing capacity, before an unstarted head takes a free slot."""
@@ -455,9 +531,14 @@ class Daemon:
         for row in rows:
             n = int(row["number"])
             cancelled = Event() if isinstance(self.admission, Admission) else None
-            self.inflight[n] = {"future": self._pool.submit(self._timed_read, row, base, cancelled),
+            source = source_identity(self.admission, n, row.get("headRefOid"), base,
+                                     self.round_inputs.get(n))
+            attempt = AdmissionAttempt(self.state_dir, n, row.get("headRefOid"), base,
+                                       clock=self.clock, persist=not self.dry_run, source=source)
+            self._pending_attempt_history[attempt._data["attempt_id"]] = attempt
+            self.inflight[n] = {"future": self._pool.submit(attempt.run, self._timed_read, row, base, cancelled),
                                 "row": row, "base": base, "cancelled": cancelled,
-                                "inputs": self.round_inputs.get(n)}
+                                "inputs": self.round_inputs.get(n), "attempt": attempt}
 
     def _owned_candidates(self, rows: list[dict], slots: int, summary: dict) -> list[dict]:
         """Leave unstarted heads for discovery at their current source and priority."""
@@ -470,7 +551,15 @@ class Daemon:
         return rows[:free]
 
     def _tick(self, requested: set[int] | None = None, changed: dict | None = None) -> dict:
-        summary = self._tick_body(requested, changed)
+        try:
+            summary = self._tick_body(requested, changed)
+        except Exception as error:
+            try:
+                self.save(self.load_state(), {"tick": "ERROR", "at": _stamp(self.clock),
+                                               "reason": "TICK_FAILED:" + type(error).__name__})
+            except OSError:
+                pass  # A failed observation write must not replace the original error.
+            raise
         if summary.get("tick") == "RAN" and not self.dry_run:
             self._write_tick_receipt(summary)
         return summary
@@ -666,8 +755,11 @@ class Daemon:
         return summary
 
     def land(self, admitted: list[int], rows: list[dict], by_number: dict, state: dict, summary: dict) -> None:
+        def observed(receipt, path, digest):
+            project_receipt(state, receipt, path, digest, self.clock())
+            self.save(state, summary)
         train = Train(self.git, self.gh, self.gate, receipts=self.receipts, clock=self.clock, sleep=self.sleep,
-                      dry_run=self.dry_run, is_union=self.is_union,
+                      dry_run=self.dry_run, is_union=self.is_union, on_receipt=observed,
                       **{**self.train_options, "hold_label": self.hold_label})
         receipt = train.run(admitted, rows=rows)
         summary["receipt"] = str(train.path)

@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from . import history, rules
+from .admission_attempt import command_environment, command_started, command_finished
 from .errors import ReadFailed
 from .locks import SlotPool
 from .redact import redact
@@ -181,7 +182,7 @@ class Admission:
         if cancelled is not None and cancelled.is_set():
             raise ReadFailed("ADMISSION_CANCELLED")
         env = {**os.environ, "SVRF_HEAD": head, "SVRF_BASE": base, "SVRF_CLONE": str(root),
-               "SVRF_ADMISSION_READS": str(reads)}
+               "SVRF_ADMISSION_READS": str(reads), **command_environment()}
         if pr is not None:
             env["SVRF_PR"] = str(pr)
         # A dedicated Linux subreaper owns this command, including test processes
@@ -191,23 +192,27 @@ class Admission:
         supervisor = str(Path(__file__).with_name("_admission_process.py").resolve())
         proc = subprocess.Popen([sys.executable, "-I", supervisor, self.command], cwd=str(root), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        deadline = time.monotonic() + self.timeout
-        while True:
-            remaining = max(0, deadline - time.monotonic())
-            try:
-                stdout, stderr = proc.communicate(
-                    timeout=min(remaining, 0.25) if cancelled is not None else remaining)
-                break
-            except subprocess.TimeoutExpired:
-                # Communication must finish, not just the command leader: a child
-                # can keep inherited pipes open after its parent exits. Completed
-                # output keeps its original result even if cancellation raced it.
-                if cancelled is not None and cancelled.is_set():
-                    _stop_command(proc)
-                    raise ReadFailed("ADMISSION_CANCELLED")
-                if time.monotonic() >= deadline:
-                    _stop_command(proc)
-                    raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
+        command_started(proc, root)
+        try:
+            deadline = time.monotonic() + self.timeout
+            while True:
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    stdout, stderr = proc.communicate(
+                        timeout=min(remaining, 0.25) if cancelled is not None else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    # Communication must finish, not just the command leader: a child
+                    # can keep inherited pipes open after its parent exits. Completed
+                    # output keeps its original result even if cancellation raced it.
+                    if cancelled is not None and cancelled.is_set():
+                        _stop_command(proc)
+                        raise ReadFailed("ADMISSION_CANCELLED")
+                    if time.monotonic() >= deadline:
+                        _stop_command(proc)
+                        raise ReadFailed("ADMISSION_COMMAND_TIMEOUT")
+        finally:
+            command_finished(proc.returncode)
         done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if done.returncode in UNAVAILABLE_EXITS:
             if done.returncode == 126:

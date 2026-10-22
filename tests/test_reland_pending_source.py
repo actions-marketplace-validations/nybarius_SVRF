@@ -2,6 +2,7 @@
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -45,7 +46,11 @@ class PendingRebuiltSource(unittest.TestCase):
 
                 def tick():
                     try:
-                        owner.tick()
+                        deadline = time.monotonic() + 2
+                        while True:
+                            owner.tick()
+                            if entered.is_set() or time.monotonic() >= deadline:
+                                break
                     except BaseException as error:
                         errors.append(repr(error))
                     finally:

@@ -45,6 +45,56 @@ class FailingRead:
         raise ReadFailed(self.reason)
 
 
+class SourceBindings(unittest.TestCase):
+    def identity(self, kind):
+        from svrf.admission import Admission
+        from svrf.admission_retry import source_identity
+        repo = DaemonRepo([1])
+        repo.root = Path("/tmp/source-binding")
+        return source_identity(Admission(repo, order="tests-first", kind=kind,
+                                         command="original-command"), 1, "h1", "c0")
+
+    def test_configured_path_sets_are_part_of_the_actual_source_occurrence(self):
+        from svrf.app import kind_of
+        from svrf.config import Config, HistoryConfig
+        kinds = [kind_of(Config(repo="owner/repo", history=HistoryConfig(tests=tests, docs=[])))
+                 for tests in (["src/**"], [])]
+        self.assertEqual([kind("src/f.py") for kind in kinds], ["test", "code"])
+        before, after = map(self.identity, kinds)
+        self.assertEqual([before["source_status"], after["source_status"]], ["OBSERVED", "OBSERVED"])
+        self.assertNotEqual(before["command_fingerprint"], after["command_fingerprint"])
+        self.assertNotEqual(before["occurrence_key"], after["occurrence_key"])
+        self.assertEqual(before, self.identity(kinds[0]))
+
+    def test_defaults_and_supported_closure_values_are_consumed_configuration(self):
+        def configured(value):
+            return lambda path: value
+        for kinds in ((configured("test"), configured("code")),
+                      (lambda path, value="test": value, lambda path, value="code": value)):
+            with self.subTest(kind=kinds[0]):
+                before, after = map(self.identity, kinds)
+                self.assertNotEqual(before["command_fingerprint"], after["command_fingerprint"])
+                self.assertNotEqual(before["occurrence_key"], after["occurrence_key"])
+
+    def test_an_unsupported_closure_cannot_authorize_a_same_source_delay(self):
+        import threading
+        resource = threading.Event()
+        kind = lambda path: "test" if resource.is_set() else "code"
+        self.assertEqual(self.identity(kind)["source_status"], "UNOBSERVED")
+
+    def test_compiled_matcher_changes_are_bound_even_if_the_display_patterns_do_not_change(self):
+        import re
+        from svrf.globs import PathSet
+        from svrf.history import path_kind
+        paths = PathSet(["src/**"])
+        kind = path_kind(paths, PathSet())
+        before = self.identity(kind)
+        self.assertEqual(kind("src/f.py"), "test")
+        paths._regex = re.compile("never-match")
+        self.assertEqual(kind("src/f.py"), "code")
+        self.assertNotEqual(before["occurrence_key"], self.identity(kind)["occurrence_key"])
+
+
 class ReadBackoff(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -163,6 +163,37 @@ class AttemptState(unittest.TestCase):
 
 
 class SnapshotDurability(unittest.TestCase):
+    def test_clock_only_observations_do_not_rewrite_the_original_attempt(self):
+        from itertools import count
+        from unittest.mock import patch
+        from svrf.admission_attempt import AdmissionAttempt
+        from test_admission_progress_projection import beginning, encode_events
+        with tempfile.TemporaryDirectory() as temporary:
+            clock = count(100).__next__
+            with patch("svrf.admission_attempt.tempfile.NamedTemporaryFile",
+                       wraps=tempfile.NamedTemporaryFile) as writes:
+                attempt = AdmissionAttempt(Path(temporary), 1, "h1", "c0", clock=clock)
+                original = attempt.path.read_bytes()
+                first, second = attempt.snapshot(), attempt.snapshot()
+                self.assertGreater(second["observed_at"], first["observed_at"])
+                self.assertGreater(second["progress"]["observed_at"], first["progress"]["observed_at"])
+                self.assertEqual(writes.call_count, 1, "clock observations rewrote unchanged original facts")
+                self.assertEqual(attempt.path.read_bytes(), original)
+                attempt.update(stage="command")
+                self.assertEqual(writes.call_count, 2)
+                attempt.progress_file.parent.mkdir(parents=True)
+                attempt.progress_file.write_bytes(encode_events([beginning()]))
+                observed = attempt.snapshot()
+                self.assertEqual(observed["progress"]["status"], "OBSERVED")
+                self.assertEqual(writes.call_count, 3, "new original progress was not retained")
+                again = attempt.snapshot()
+                self.assertGreater(again["progress"]["summary"]["observed_at"],
+                                   observed["progress"]["summary"]["observed_at"])
+                self.assertEqual(writes.call_count, 3)
+                attempt.progress_file.write_bytes(b"corrupt\n")
+                self.assertEqual(attempt.snapshot()["progress"]["status"], "UNOBSERVED")
+                self.assertEqual(writes.call_count, 4, "changed progress bytes borrowed an old observation")
+
     def test_live_snapshots_do_not_wait_for_a_terminal_storage_flush(self):
         from unittest.mock import patch
         from svrf.admission_attempt import AdmissionAttempt

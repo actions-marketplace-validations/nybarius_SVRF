@@ -25,7 +25,7 @@ import re
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .locks import SlotPool, flocked
@@ -43,6 +43,22 @@ def meminfo_available_gb() -> float:
     except OSError:
         pass
     return 0.0
+
+
+@contextmanager
+def _phase(seconds: dict, status: dict, name: str):
+    """Measure one boundary, including its partial duration if it raises."""
+    started = time.monotonic()
+    status[name] = "running"
+    try:
+        yield
+    except BaseException:
+        status[name] = "failed"
+        raise
+    else:
+        status[name] = "complete"
+    finally:
+        seconds[name] = round(seconds.get(name, 0.0) + time.monotonic() - started, 3)
 
 
 class MemoryGuard:
@@ -94,24 +110,35 @@ class CommandGate:
         root = cwd or self.clone
         return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
 
-    def _prepare(self, slot: Path, commit: str) -> None:
+    def _prepare(self, slot: Path, commit: str, *, phase_seconds: dict | None = None,
+                 phase_status: dict | None = None) -> None:
+        seconds = {} if phase_seconds is None else phase_seconds
+        status = {} if phase_status is None else phase_status
+        for name in ("worktree_create", "index_flags", "checkout", "clean"):
+            status.setdefault(name, "not_started")
         if not (slot / ".git").exists():
-            slot.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "-C", str(self.clone), "worktree", "prune"], capture_output=True)
-            self._git("worktree", "add", "-q", "--detach", "-f", str(slot), commit)
+            status.update(index_flags="skipped", checkout="skipped")
+            with _phase(seconds, status, "worktree_create"):
+                slot.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(["git", "-C", str(self.clone), "worktree", "prune"], capture_output=True)
+                self._git("worktree", "add", "-q", "--detach", "-f", str(slot), commit)
         else:
-            # A reused slot may carry flags that hide changed bytes. Clear each
-            # kind independently; skip-worktree also suppresses force-checkout.
-            entries = subprocess.run(["git", "-C", str(slot), "ls-files", "-v", "-z"],
-                                     check=True, capture_output=True).stdout.split(b"\0")
-            assumed = [e[2:] for e in entries if e[:1].islower()]
-            skipped = [e[2:] for e in entries if e[:1].upper() == b"S"]
-            for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
-                if paths:
-                    subprocess.run(["git", "-C", str(slot), "update-index", option, "-z", "--stdin"],
-                                   input=b"\0".join(paths) + b"\0", check=True, capture_output=True)
-            self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
-        self._git("clean", "-fdq", cwd=slot)
+            status["worktree_create"] = "skipped"
+            with _phase(seconds, status, "index_flags"):
+                # A reused slot may carry flags that hide changed bytes. Clear each
+                # kind independently; skip-worktree also suppresses force-checkout.
+                entries = subprocess.run(["git", "-C", str(slot), "ls-files", "-v", "-z"],
+                                         check=True, capture_output=True).stdout.split(b"\0")
+                assumed = [e[2:] for e in entries if e[:1].islower()]
+                skipped = [e[2:] for e in entries if e[:1].upper() == b"S"]
+                for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+                    if paths:
+                        subprocess.run(["git", "-C", str(slot), "update-index", option, "-z", "--stdin"],
+                                       input=b"\0".join(paths) + b"\0", check=True, capture_output=True)
+            with _phase(seconds, status, "checkout"):
+                self._git("checkout", "-q", "--detach", "-f", commit, cwd=slot)
+        with _phase(seconds, status, "clean"):
+            self._git("clean", "-fdq", cwd=slot)
 
     def _step(self, command: str, cwd: Path, log: Path, env: dict) -> tuple[int, str, float]:
         started = time.monotonic()
@@ -127,38 +154,72 @@ class CommandGate:
         return rc, text, round(time.monotonic() - started, 3)
 
     def run(self, base: str, commit: str, label: str = "") -> dict:
-        slot = self.slots.acquire()
+        # Preparation details are a breakdown of worktree_prepare, not extra time.
+        # Absent seconds with not_started/skipped status are never observed zero waits.
+        timing = {
+            "phase_seconds": {},
+            "phase_status": {name: "not_started" for name in
+                             ("slot_wait", "worktree_prepare", "metadata", "setup_lock_wait",
+                              "setup_commands", "gate_commands", "slot_release")},
+            "prepare_phase_seconds": {},
+            "prepare_phase_status": {name: "not_started" for name in
+                                     ("worktree_create", "index_flags", "checkout", "clean")},
+        }
+        seconds, status = timing["phase_seconds"], timing["phase_status"]
+        if not self.setup:
+            status.update(setup_lock_wait="skipped", setup_commands="skipped")
+        if not self.commands:
+            status["gate_commands"] = "skipped"
         try:
-            self._prepare(slot, commit)
-            tree = self._git("rev-parse", "HEAD^{tree}", cwd=slot)
-            logs = self.logs / f"{label or 'gate'}-{commit[:12]}"
-            logs.mkdir(parents=True, exist_ok=True)
-            changed = self._git("diff", "--name-only", "--no-renames", base, commit, cwd=slot)
-            (logs / "changed.txt").write_text(changed + ("\n" if changed else ""), encoding="utf-8")
-            env = {**self.env, "SVRF_BASE": base, "SVRF_COMMIT": commit, "SVRF_LABEL": label,
-                   "SVRF_CHANGED_FILES": str(logs / "changed.txt")}
-            steps: list[dict] = []
-            result = {"green": False, "read_failure": None, "tree": tree, "slot": slot.name, "logs": str(logs),
-                      "steps": steps, "failing": []}
-            plan = [("setup", c) for c in self.setup] + [("gate", c) for c in self.commands]
-            for index, (phase, command) in enumerate(plan):
-                log = logs / f"{index:02d}-{phase}.log"
-                if phase == "setup":
-                    with flocked(self.setup_lock, block=True):
-                        rc, text, seconds = self._step(command, slot, log, env)
-                else:
-                    rc, text, seconds = self._step(command, slot, log, env)
-                lines = [ANSI.sub("", line) for line in text.splitlines()]
-                steps.append({"phase": phase, "command": command, "rc": rc, "seconds": seconds,
-                              "tail": (lines or [""])[-1][:200]})
-                if rc is None:
-                    result["read_failure"] = f"GATE_TIMEOUT:{command[:80]}"
-                    return result
-                if rc != 0:
-                    result["read_failure"] = gate_infra_failure(text, self.infra_patterns)
-                    result["failing"] = [line for line in lines if self.failing.search(line)][:12] or lines[-8:]
-                    return result
-            result["green"] = True
-            return result
-        finally:
-            self.slots.release(slot)
+            with _phase(seconds, status, "slot_wait"):
+                slot = self.slots.acquire()
+            try:
+                with _phase(seconds, status, "worktree_prepare"):
+                    self._prepare(slot, commit, phase_seconds=timing["prepare_phase_seconds"],
+                                  phase_status=timing["prepare_phase_status"])
+                with _phase(seconds, status, "metadata"):
+                    tree = self._git("rev-parse", "HEAD^{tree}", cwd=slot)
+                    logs = self.logs / f"{label or 'gate'}-{commit[:12]}"
+                    logs.mkdir(parents=True, exist_ok=True)
+                    changed = self._git("diff", "--name-only", "--no-renames", base, commit, cwd=slot)
+                    (logs / "changed.txt").write_text(changed + ("\n" if changed else ""), encoding="utf-8")
+                    env = {**self.env, "SVRF_BASE": base, "SVRF_COMMIT": commit, "SVRF_LABEL": label,
+                           "SVRF_CHANGED_FILES": str(logs / "changed.txt")}
+                steps: list[dict] = []
+                result = {"green": False, "read_failure": None, "tree": tree, "slot": slot.name,
+                          "logs": str(logs), "steps": steps, "failing": [], **timing}
+                plan = [("setup", c) for c in self.setup] + [("gate", c) for c in self.commands]
+                for index, (phase, command) in enumerate(plan):
+                    log = logs / f"{index:02d}-{phase}.log"
+                    if phase == "setup":
+                        with ExitStack() as acquired:
+                            with _phase(seconds, status, "setup_lock_wait"):
+                                acquired.enter_context(flocked(self.setup_lock, block=True))
+                            with _phase(seconds, status, "setup_commands"):
+                                rc, text, elapsed = self._step(command, slot, log, env)
+                    else:
+                        with _phase(seconds, status, "gate_commands"):
+                            rc, text, elapsed = self._step(command, slot, log, env)
+                    lines = [ANSI.sub("", line) for line in text.splitlines()]
+                    steps.append({"phase": phase, "command": command, "rc": rc, "seconds": elapsed,
+                                  "tail": (lines or [""])[-1][:200]})
+                    if rc is None:
+                        result["read_failure"] = f"GATE_TIMEOUT:{command[:80]}"
+                        return result
+                    if rc != 0:
+                        result["read_failure"] = gate_infra_failure(text, self.infra_patterns)
+                        result["failing"] = [line for line in lines if self.failing.search(line)][:12] or lines[-8:]
+                        return result
+                result["green"] = True
+                return result
+            finally:
+                with _phase(seconds, status, "slot_release"):
+                    self.slots.release(slot)
+        except BaseException as error:
+            # Keep the original exception/type. Train can retain the partial timings
+            # when it classifies that original failure; no shared mutable run state.
+            try:
+                error.gate_phase_timing = timing
+            except Exception:
+                pass
+            raise

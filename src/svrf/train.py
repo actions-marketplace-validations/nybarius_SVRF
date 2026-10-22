@@ -341,7 +341,9 @@ class Train:
         if known is not None:
             # a tree already gated red is never landed: reuse the red result
             row = {**self.receipt["gates"][known], "family": family["id"], "prs": family["prs"], "base": base,
-                   "commit": family["commit"], "reused": known, "seconds": 0.0}
+                   "commit": family["commit"], "reused": known, "seconds": 0.0,
+                   "phase_seconds": {}, "phase_status": {"gate": "reused"},
+                   "prepare_phase_seconds": {}, "prepare_phase_status": {}}
             with self.lock:
                 family["gate"] = len(self.receipt["gates"])
                 family["status"] = "RED"
@@ -349,16 +351,35 @@ class Train:
             return row
         started = self.clock()
         wall = time.monotonic()
+        memory_seconds = 0.0
+        memory_status = "skipped"
         try:
             if self.memory is not None:
+                memory_status = "running"
+                memory_started = time.monotonic()
                 with self.memory.admit():
+                    memory_seconds = round(time.monotonic() - memory_started, 3)
+                    memory_status = "complete"
                     result = self.gate.run(base, family["commit"], family["id"])
             else:
                 result = self.gate.run(base, family["commit"], family["id"])
         except Exception as error:  # a gate that could not run is retried, not red
+            if memory_status == "running":
+                memory_seconds = round(time.monotonic() - memory_started, 3)
+                memory_status = "failed"
             result = {"green": False, "read_failure": f"GATE_FAILED:{type(error).__name__}:{error}"}
+            partial = getattr(error, "gate_phase_timing", None)
+            if isinstance(partial, dict):
+                for name in ("phase_seconds", "phase_status", "prepare_phase_seconds", "prepare_phase_status"):
+                    if name in partial:
+                        result[name] = partial[name]
+            else:
+                result["phase_status"] = {
+                    "gate_details": "not_started" if memory_status == "failed" else "unavailable"}
         completed_event = self._event("gate_completed")
         result = dict(result)
+        result["phase_seconds"] = {**result.get("phase_seconds", {}), "memory_wait": memory_seconds}
+        result["phase_status"] = {**result.get("phase_status", {}), "memory_wait": memory_status}
         if result.get("tree") not in (None, family["tree"]):
             result["green"] = False
             result.setdefault("failing", []).append(

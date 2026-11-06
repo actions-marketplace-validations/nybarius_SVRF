@@ -156,8 +156,26 @@ class RealGitHub:
         self._gh(["api", f"repos/{self.repo}/issues/{number}/comments", "-f", f"body={body}"], "rest")
 
     def list_comments(self, number: int) -> list[dict]:
-        value = json.loads(self._gh(["api", f"repos/{self.repo}/issues/{number}/comments?per_page=100"], "rest"))
-        return [{"id": v["id"], "body": v.get("body") or ""} for v in value]
+        """Read every page before a caller may conclude that a comment is absent."""
+        rows, seen, page = [], set(), 1
+        while True:
+            try:
+                values = json.loads(self._gh([
+                    "api", f"repos/{self.repo}/issues/{number}/comments?per_page=100&page={page}"], "rest"))
+                if type(values) is not list or len(values) > 100:
+                    raise ValueError("invalid page")
+                for value in values:
+                    comment_id, body = value["id"], value.get("body")
+                    if (type(comment_id) is not int or comment_id < 1 or comment_id in seen
+                            or (body is not None and type(body) is not str)):
+                        raise ValueError("invalid or repeated comment")
+                    seen.add(comment_id)
+                    rows.append({"id": comment_id, "body": body or ""})
+                if len(values) < 100:
+                    return rows
+                page += 1
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReadFailed("COMMENTS_UNOBSERVED") from exc
 
     def update_comment(self, comment_id: int, body: str) -> None:
         self._gh(["api", "-X", "PATCH", f"repos/{self.repo}/issues/comments/{comment_id}",

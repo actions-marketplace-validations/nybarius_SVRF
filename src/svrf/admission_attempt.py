@@ -267,7 +267,8 @@ class AdmissionAttempt:
     def run(self, function, *args):
         token = _CURRENT.set(self)
         try:
-            self.update(stage="admission")
+            self.update(stage="admission", admission_started_at=self.clock(),
+                        admission_started_monotonic=time.monotonic())
             value, failure, seconds = function(*args)
             with self._lock:
                 self._finished = time.monotonic()
@@ -308,7 +309,9 @@ def command_environment() -> dict:
 def command_started(proc, root: Path) -> None:
     attempt = _CURRENT.get()
     if attempt is not None:
-        attempt.update(stage="command", process=process_identity(proc.pid), slot=str(root))
+        attempt.update(stage="command", command_started_at=attempt.clock(),
+                       command_started_monotonic=time.monotonic(),
+                       process=process_identity(proc.pid), slot=str(root))
 
 
 def command_finished(returncode: int) -> None:

@@ -536,7 +536,9 @@ class BaseBranch(unittest.TestCase):
         repo = DaemonRepo([201, 202])
         gh = DaemonGitHub(repo, bases={202: "pr-201"})
         admission = Admission({"h201": {"verdict": "HELD", "residuals": ["check:x"]}})
-        out = daemon(repo, gh, FakeGate(repo), admission, self.tmp).tick()
+        # the parent's hold surface is off here: this reads only the stacked head's own calls
+        out = daemon(repo, gh, FakeGate(repo), admission, self.tmp,
+                     train={"status_checks": False, "pr_comments": False}).tick()
         self.assertEqual(out["skipped"], {"202": "WAITING_PARENT"})
         self.assertEqual(gh.calls["rest"], 0)
         self.assertEqual([h for h, _ in admission.calls], ["h201"])

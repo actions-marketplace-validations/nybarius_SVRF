@@ -1,6 +1,7 @@
 """Original gate completion and merge acknowledgement have distinct clocks."""
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -132,6 +133,36 @@ class ProducerClocks(unittest.TestCase):
         self.assertEqual(len(receipt["merges"]), 1)
         self.assertTrue(receipt["merges"][0]["identity"])
         self.assertEqual(receipt.get("state_projection", {}).get("status"), "UNOBSERVED")
+
+    def test_each_projected_receipt_keeps_its_original_bytes_after_later_saves(self):
+        train = self.train()
+        observed = []
+        def receive(receipt, path, digest):
+            observed.append((deepcopy(receipt), path, digest))
+        train.on_receipt = receive
+        result = train.run([1])
+        self.assertEqual(len(result["merges"]), 1)
+        self.assertGreater(len(observed), 1)
+        self.clock.sleep(7)
+        train._save()
+        for receipt, path, digest in observed:
+            raw = path.read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), digest,
+                             "a later progress save replaced original projected evidence")
+            self.assertEqual(json.loads(raw), receipt)
+        self.assertEqual(json.loads(train.path.read_bytes()), train.receipt)
+
+    def test_final_state_receipt_link_resolves_after_train_finishes(self):
+        self.make_owner().tick()
+        history = self.owner.load_state()["train_gate_history"]
+        self.assertTrue(history)
+        for row in history.values():
+            raw = Path(row["receipt"]).read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), row["receipt_sha256"])
+            receipt = json.loads(raw)
+            self.assertTrue(receipt["gates"][row["gate_index"]]["green"])
+            self.assertEqual(receipt["merges"], row["merges"])
+            self.assertTrue(row["merges"][0]["identity"])
 
 
 if __name__ == "__main__":

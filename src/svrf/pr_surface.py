@@ -2,14 +2,16 @@
 developer sees the train's decision about their head without leaving the pull request.
 
 Pure rendering only: every function here takes a plain `event` dict and returns text: no
-git, no GitHub, no clock. `Train._surface_event` (`train.py`) is the one place that turns
-a family/gate/hold decision into an `event` and calls out to `self.gh`.
+git, no GitHub, no clock. `train.post_surface` is the one place that posts an `event` to
+GitHub; `Train._surface_event` builds the family/gate/hold events and `Daemon.hold` the
+admission holds'.
 
 An `event` carries: `number` (int), `phase` (`QUEUED`, `GATING`, `LANDED`, `HELD`),
 `history` (phases already reached, oldest first), `position` (queue position, `QUEUED`
 only), `batch` (family id) and `members` (the family's pull-request numbers), `gate_seconds`
 (once a gate ran), and, once held, `reason_line`, `failing` (residual lines) and, when the
-hold is a conflict with a named partner, `conflict_with` and `conflict_paths`.
+hold is a conflict with a named partner, `conflict_with` and `conflict_paths`; an admission
+hold also carries the held `head` sha.
 
 A pull request's title, branch name and gate output are attacker-controlled (anyone who
 can open a pull request controls them); `escape_md` and `_fence` keep them literal text in
@@ -129,6 +131,8 @@ def render_comment(event: dict) -> str:
         lines.append(line)
     if phase == "QUEUED" and event.get("position") is not None:
         lines.append(f"Queue position **{event['position']}**")
+    if event.get("head"):
+        lines.append(f"Head `{re.sub(r'[^0-9A-Za-z]', '', str(event['head']))[:64]}`")
     lines.append("")
     lines.append(_timeline(event))
     if event.get("gate_seconds") is not None:

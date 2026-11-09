@@ -7,6 +7,15 @@ project intends to follow [Semantic Versioning](https://semver.org/) once it rea
 
 ## [Unreleased]
 
+### Fixed
+
+- `make docker` (the container gate) smoke tests the image it just built. It builds with
+  `--load`, so a Buildx docker-container builder hands its image to the engine instead of
+  leaving it in the build cache, where the smoke test would run an older `svrf` image or fail
+  to find one. With no `DOCKER_HOST`, it uses the caller's rootless Podman socket
+  (`$XDG_RUNTIME_DIR/podman/podman.sock`) when one exists, so the gate needs no access to the
+  root Docker daemon.
+
 ### Added
 
 - Attributed splitting of a red family. When the gate's failing lines name a path (or that

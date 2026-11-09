@@ -1,9 +1,8 @@
 # Agent hooks
 
-SVRF holds and re-reads pull requests automatically; a coding agent whose pull request
-got held has no way to find out why except polling the repository and guessing. These
-three surfaces exist so an agent can ask directly, in its own tool loop, without a human
-relaying the answer:
+SVRF holds and re-reads pull requests automatically. When PR surfacing is enabled,
+a held head's status and failing lines are also visible on GitHub. These local
+interfaces provide structured evidence for an agent's own tool loop:
 
 | Surface | What it answers |
 | --- | --- |

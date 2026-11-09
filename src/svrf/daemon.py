@@ -51,7 +51,8 @@ from .admission_retry import retain_failure, source_identity
 from .train_events import project_receipt
 from .errors import RateLimited, ReadFailed
 from .locks import owner_lock
-from .train import Train
+from . import pr_surface
+from .train import Train, post_surface, reason_line
 
 _tick_serial = itertools.count()
 STATE_SCHEMA = "svrf.state/1"
@@ -69,6 +70,20 @@ def _stamp(clock) -> str:
 def _strip_trailers(text: str) -> str:
     """A body copied onto a superseding pull request keeps its prose, not its trailers."""
     return "\n".join(line for line in text.splitlines() if not line.lower().startswith("co-authored-by:"))
+
+
+class _AdmissionCancellation:
+    """An attempt's explicit cancellation and its owner's stop request."""
+
+    def __init__(self, stop_requested: Callable[[], bool]):
+        self._explicit = Event()
+        self._stop_requested = stop_requested
+
+    def is_set(self) -> bool:
+        return self._explicit.is_set() or self._stop_requested()
+
+    def set(self) -> None:
+        self._explicit.set()
 
 
 class Daemon:
@@ -334,11 +349,17 @@ class Daemon:
         # Only the built-in Admission takes the PR number (SVRF_PR); other callables keep (head, base).
         extra = (row["number"],) if isinstance(self.admission, Admission) and row.get("number") is not None else ()
         options = {"cancelled": cancelled} if cancelled is not None else {}
-        try:
+        def before_admission():
             if cancelled is not None and cancelled.is_set():
                 raise ReadFailed("ADMISSION_CANCELLED")
+            return False  # The guard's stop hook preserves the admission failure reason.
+
+        try:
+            before_admission()
             if self.memory is not None:
-                with self.memory.admit():
+                waiting = {"stop_requested": before_admission} if cancelled is not None else {}
+                with self.memory.admit(**waiting):
+                    before_admission()
                     return self.admission(head, base, *extra, **options), None
             return self.admission(head, base, *extra, **options), None
         except Exception as error:  # surfaced to the caller, which sorts ReadFailed from the rest
@@ -578,7 +599,8 @@ class Daemon:
             if self._stop_requested:
                 break
             n = int(row["number"])
-            cancelled = Event() if isinstance(self.admission, Admission) else None
+            cancelled = (_AdmissionCancellation(lambda: self._stop_requested)
+                         if isinstance(self.admission, Admission) else None)
             source = source_identity(self.admission, n, row.get("headRefOid"), base,
                                      self.round_inputs.get(n))
             attempt = AdmissionAttempt(self.state_dir, n, row.get("headRefOid"), base,
@@ -696,6 +718,81 @@ class Daemon:
                 for n, item in self.inflight.items()}
         seen.update({int(r["number"]): r.get("headRefOid") for r in candidates})
         known: dict[int, dict] = {}
+
+        def receive(done, pending: dict, batch: list[int]) -> None:
+            for future in sorted(done, key=lambda f: pending[f]):
+                if self._stop_requested:
+                    break
+                n = pending[future]
+                item = self.inflight.pop(n)
+                row, rbase = item["row"], item["base"]
+                known[n] = row
+                value, failure, seconds = future.result()
+                summary["admission_seconds"][str(n)] = round(seconds, 3)
+                if "cancellation" in item:
+                    summary.setdefault("admission_cancelled", []).append({
+                        **item["cancellation"], "seconds": round(seconds, 3),
+                        "returned": value,
+                        "read_failure": (failure.reason if isinstance(failure, ReadFailed)
+                                         else type(failure).__name__ if failure else None),
+                    })
+                    continue  # retirement is neither an admission nor a hold
+                if self.admission_round_reads:
+                    state.setdefault("waiting_since", {})[str(n)] = self.clock()
+                if "reland" in item:
+                    if summary["stopped"] or self._stop_requested:
+                        self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
+                    else:
+                        self._finish_reland(item["reland"], row["headRefOid"], rbase,
+                                            value, failure, state, summary, revalidate=True,
+                                            admission_source=item["attempt"].snapshot())
+                    continue
+                if failure is not None:
+                    if isinstance(failure, ReadFailed):
+                        self._retry(summary, n, failure.reason)
+                    else:  # a check that could not run is a read not made
+                        self._retry(summary, n, f"ADMISSION_FAILED:{type(failure).__name__}:{failure}"[:200])
+                    continue
+                state["held"].pop(str(n), None)
+                decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
+                residuals = list(value.get("residuals") or [])
+                if decision == "ADMIT":
+                    admitted.append(n)
+                    batch.append(n)
+                elif summary["stopped"] or self._stop_requested:
+                    self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
+                elif decision == "ALREADY_MERGED":
+                    self.close_merged(row, rbase, state, summary)
+                elif decision == "REPAIR" and self.repair_enabled:
+                    self.repair(row, cls, residuals, state, summary)
+                elif decision == "RELAND":
+                    self.reland(row, cls, state, summary)
+                elif decision in ("HOLD", "REPAIR"):
+                    watch = self._watch(rbase, self._consumed_paths(value),
+                                        payloads=self._consumed_payloads(value))
+                    watch["admission_source"] = self._admission_binding(item["attempt"].snapshot())
+                    if isinstance(rbase, str) and value.get("native_conflict_base") == rbase:
+                        watch.update(base_sha=rbase, native_conflict_base=rbase)
+                    self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
+                              extra=watch)
+                else:
+                    self._retry(summary, n, cls or "ADMISSION_UNREAD")
+            summary["admitted"] = sorted(set(summary["admitted"]) | set(admitted))
+
+        def land_batch(batch: list[int], pending: dict) -> None:
+            if not self._stop_requested:
+                # One zero-wait snapshot of the original wait cohort. Refill or
+                # replacement futures are received by a later loop iteration.
+                ready = {future for future, n in pending.items()
+                         if future.done() and self.inflight.get(n, {}).get("future") is future}
+                receive(ready, pending, batch)
+            if batch:
+                if summary["stopped"]:
+                    for n in batch:
+                        self._retry(summary, n, "TRAIN_STOPPED")
+                else:
+                    self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
+
         deadline = started + self.tick_seconds if self.tick_seconds else None
         try:
             self._submit(candidates, base)
@@ -708,59 +805,12 @@ class Daemon:
                 batch: list[int] = []
                 # Keep every result already available in the same group. Slow reads
                 # do not order other heads; the train still owns folding and landing.
-                for future in sorted(done, key=lambda f: pending[f]):
-                    if self._stop_requested:
-                        break
-                    n = pending[future]
-                    item = self.inflight.pop(n)
-                    row, rbase = item["row"], item["base"]
-                    known[n] = row
-                    value, failure, seconds = future.result()
-                    summary["admission_seconds"][str(n)] = round(seconds, 3)
-                    if "cancellation" in item:
-                        summary.setdefault("admission_cancelled", []).append({
-                            **item["cancellation"], "seconds": round(seconds, 3),
-                            "returned": value,
-                            "read_failure": (failure.reason if isinstance(failure, ReadFailed)
-                                             else type(failure).__name__ if failure else None),
-                        })
-                        continue  # retirement is neither an admission nor a hold
-                    if self.admission_round_reads:
-                        state.setdefault("waiting_since", {})[str(n)] = self.clock()
-                    if "reland" in item:
-                        if summary["stopped"] or self._stop_requested:
-                            self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
-                        else:
-                            self._finish_reland(item["reland"], row["headRefOid"], rbase,
-                                                value, failure, state, summary, revalidate=True)
-                        continue
-                    if failure is not None:
-                        if isinstance(failure, ReadFailed):
-                            self._retry(summary, n, failure.reason)
-                        else:  # a check that could not run is a read not made
-                            self._retry(summary, n, f"ADMISSION_FAILED:{type(failure).__name__}:{failure}"[:200])
-                        continue
-                    state["held"].pop(str(n), None)
-                    decision, cls = rules.admission_decision(value, self.is_union, reland=self.reland_enabled)
-                    residuals = list(value.get("residuals") or [])
-                    if decision == "ADMIT":
-                        admitted.append(n)
-                        batch.append(n)
-                    elif summary["stopped"] or self._stop_requested:
-                        self._retry(summary, n, "STOP_REQUESTED" if self._stop_requested else "TRAIN_STOPPED")
-                    elif decision == "ALREADY_MERGED":
-                        self.close_merged(row, rbase, state, summary)
-                    elif decision == "REPAIR" and self.repair_enabled:
-                        self.repair(row, cls, residuals, state, summary)
-                    elif decision == "RELAND":
-                        self.reland(row, cls, state, summary)
-                    elif decision in ("HOLD", "REPAIR"):
-                        self.hold(row, "ADMISSION_HELD", state, summary, failing=residuals,
-                                  extra=self._watch(rbase, self._consumed_paths(value),
-                                                    payloads=self._consumed_payloads(value)))
-                    else:
-                        self._retry(summary, n, cls or "ADMISSION_UNREAD")
-                summary["admitted"] = sorted(set(summary["admitted"]) | set(admitted))
+                receive(done, pending, batch)
+                # Ready gates share admission reservations when a guard is configured.
+                # Let them land before fresh reads can claim the released capacity.
+                land_before_refill = self.memory is not None
+                if land_before_refill:
+                    land_batch(batch, pending)
                 # a slot freed by a finished read is refilled from the current snapshot's queue
                 # (only when the round was cut short: the list is read again when it left candidates unread)
                 if (summary.get("deferred") and slots - len(self.inflight) > 0 and not summary["stopped"]
@@ -788,14 +838,9 @@ class Daemon:
                         if more:
                             seen.update({int(r["number"]): r.get("headRefOid") for r in more})
                             self._submit(more, more_base)
-                # Refill free admission slots before the synchronous final gate.
-                # The single landing owner still gates each batch on current main.
-                if batch:
-                    if summary["stopped"]:
-                        for n in batch:
-                            self._retry(summary, n, "TRAIN_STOPPED")
-                    else:
-                        self.land(batch, [known[n] for n in batch], {n: known[n] for n in batch}, state, summary)
+                # Without a shared guard, retain admission overlap during the gate.
+                if not land_before_refill:
+                    land_batch(batch, pending)
                 self.save(state, summary)
         finally:
             if self._stop_requested:
@@ -869,8 +914,31 @@ class Daemon:
         """The base branch's content over a held head's watched paths now, or None when it
         cannot be read or the head moved anyway. The base is read once per round and
         fetched only when it moved since the hold."""
-        if (not held or not (held.get("watch") or held.get("payload_watch"))
-                or held.get("head") != row.get("headRefOid")):
+        if not held or held.get("head") != row.get("headRefOid"):
+            return None
+        if (isinstance(held.get("native_conflict_base"), str)
+                and held["native_conflict_base"] == held.get("base_sha")):
+            # A native conflict is bound to the complete base commit. Path or
+            # tree equality cannot stand in for a fresh merge on a new base.
+            try:
+                if base_now["sha"] is None:
+                    base_now["sha"] = self.git.main_sha()
+            except ReadFailed:
+                return None
+            if base_now["sha"] == held["native_conflict_base"]:
+                return held.get("watch_digest")
+            return f"{held.get('watch_digest')}:native-conflict-base:{base_now['sha']}"
+        if held.get("reason") in ("ADMISSION_HELD", "RELAND_ADMISSION_HELD"):
+            # An original negative verdict consumes its checker configuration and
+            # environment too. Reuse the attempt owner's identities, not a new
+            # scheduler or a reset of the retained failed occurrence. A legacy
+            # hold without that basis has an unobserved read and is checked once.
+            current = self._admission_binding(source_identity(
+                self.admission, int(row["number"]), row.get("headRefOid"), held.get("base_sha")))
+            if current != self._admission_binding(held.get("admission_source") or {}):
+                return (f"{held.get('watch_digest')}:admission-source:"
+                        f"{current['command_fingerprint']}:{current['environment_fingerprint']}")
+        if not (held.get("watch") or held.get("payload_watch")):
             return None
         digest = getattr(self.git, "watch_digest", None)
         if digest is None:
@@ -883,6 +951,7 @@ class Daemon:
                 # Recover the original basis before comparing a possibly changed base.
                 held["watch_digest"] = digest(held["base_sha"], held.get("watch") or [],
                                               **({"payloads": payloads} if payloads else {}))
+                held.pop("watch_read_failure", None)
             if base_now["sha"] is None:
                 base_now["sha"] = self.git.main_sha()
             if base_now["sha"] == held.get("base_sha"):
@@ -897,6 +966,14 @@ class Daemon:
         if value == held.get("watch_digest"):
             held["base_sha"] = base_now["sha"]      # the base moved elsewhere: nothing reopens
         return value
+
+    @staticmethod
+    def _admission_binding(source: dict) -> dict:
+        # Configuration/environment are the original owner's separate identities.
+        # source_status also consumes admission_watch; its original watch owner
+        # retains unreadability instead of comparing it with an omitted watch.
+        return {key: source.get(key) for key in (
+            "command_fingerprint", "environment_fingerprint")}
 
     @staticmethod
     def _consumed_paths(value: dict) -> list[str]:
@@ -932,7 +1009,8 @@ class Daemon:
         try:
             watch["watch_digest"] = digest(base, paths,
                                            **({"payloads": payloads} if payloads else {}))
-        except ReadFailed:
+        except ReadFailed as failure:
+            watch["watch_read_failure"] = failure.reason
             return watch  # Keep the basis for a later read; no digest was observed.
         return watch
 
@@ -1022,10 +1100,31 @@ class Daemon:
         entry = {"head": row.get("headRefOid"), "head_ref": row.get("headRefName"),
                  "title": row.get("title", ""), "reason": reason, "class": cls,
                  "failing": list(failing)[:24], "paths": list(paths), "at": summary["at"], **(extra or {})}
+        self._surface_hold(n, entry, state["held"].get(str(n)))
         state["held"][str(n)] = entry
         summary["held_rows"].append({"number": n, **entry})
         if n not in summary["held"]:
             summary["held"].append(n)
+
+    def _surface_hold(self, n: int, entry: dict, previous: dict | None) -> None:
+        """Show the hold on the pull request through the train's own surface, so a worker that
+        reads only the pull request sees the held head and every failing line. A hold already
+        shown at the same head is not posted again; a failed post leaves `surfaced` unset, so
+        the next hold of that pull request posts it."""
+        status_checks = self.train_options.get("status_checks", True)
+        pr_comments = self.train_options.get("pr_comments", True)
+        if self.dry_run or not entry["head"] or not (status_checks or pr_comments):
+            return
+        event = {"number": n, "phase": "HELD", "history": [], "head": entry["head"],
+                 "failing": entry["failing"],
+                 "reason_line": reason_line(entry["reason"], entry["paths"], entry["failing"], None)}
+        shown = pr_surface.comment_hash(pr_surface.render_comment(event))
+        if previous and previous.get("head") == entry["head"] and previous.get("surfaced") == shown:
+            entry["surfaced"] = shown
+            return
+        if post_surface(self.gh, lambda fn, *args: fn(*args), entry["head"], event, status_checks=status_checks,
+                        pr_comments=pr_comments, dashboard_url=self.train_options.get("dashboard_url") or ""):
+            entry["surfaced"] = shown
 
     def repair(self, row: dict, cls: str, lines: list[str], state: dict, summary: dict) -> None:
         """Union-merge the current base into the branch and push it by refspec; the new
@@ -1176,8 +1275,10 @@ class Daemon:
             self._submit([candidate], base_sha)
             self.inflight[n]["reland"] = original
             return
+        admission_source = source_identity(self.admission, n, final, base_sha, original["inputs"])
         value, error = self._read_admission(candidate, base_sha)
-        self._finish_reland(original, final, base_sha, value, error, state, summary)
+        self._finish_reland(original, final, base_sha, value, error, state, summary,
+                            admission_source=admission_source)
 
     def _reland_source(self, row: dict) -> str | None:
         """A delayed successor is publishable only for the still-ready original source."""
@@ -1205,7 +1306,8 @@ class Daemon:
         return None
 
     def _finish_reland(self, original: dict, final: str, base_sha: str, value, error,
-                       state: dict, summary: dict, *, revalidate: bool = False) -> None:
+                       state: dict, summary: dict, *, revalidate: bool = False,
+                       admission_source: dict | None = None) -> None:
         """Receive the original reader's result before any successor publication."""
         row, cls = original["row"], original["class"]
         n = int(row["number"])
@@ -1225,7 +1327,9 @@ class Daemon:
         if value.get("verdict") == "HELD" and residuals:
             self.hold(row, "RELAND_ADMISSION_HELD", state, summary, failing=residuals, cls=cls,
                       extra={**self._watch(base_sha, self._consumed_paths(value),
-                                           payloads=self._consumed_payloads(value)), "repair_head": final})
+                                           payloads=self._consumed_payloads(value)),
+                             "admission_source": self._admission_binding(admission_source or {}),
+                             "repair_head": final})
             return
         if (value.get("verdict") != "MERGEABLE" or residuals
                 or (value.get("admission") or {}).get("complete", True) is not True):

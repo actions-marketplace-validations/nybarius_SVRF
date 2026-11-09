@@ -4,7 +4,7 @@
 
 # Silicon Valley Rocket Fuel (SVRF)
 
-**The merge queue built for AI agent swarms — batches, bisects, and proves every landing.**
+**The merge train for coding-agent swarms. Batch compatible PRs, isolate failures, verify landed trees.**
 
 [![CI](https://github.com/nybarius/SVRF/actions/workflows/ci.yml/badge.svg)](https://github.com/nybarius/SVRF/actions/workflows/ci.yml)
 [![License: PolyForm Shield 1.0.0](https://img.shields.io/badge/license-PolyForm%20Shield%201.0.0-blue.svg)](LICENSE)
@@ -12,14 +12,14 @@
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
-SVRF is a merge queue for AI coding agents: when Claude Code, Codex or another swarm of
-agents opens pull requests faster than CI can gate them one by one, SVRF is the merge train
-that keeps up. It runs as a GitHub Actions workflow, a CLI, or a container; watches a GitHub
+SVRF is a self-hosted merge train for repositories where coding agents open pull
+requests faster than they can be reviewed, tested, and merged one by one. It runs as a GitHub Actions workflow, a CLI, or a container; watches a GitHub
 repository; folds compatible ready pull requests together; runs **your** gate command once
 on the folded tree; bisects a red batch down to the pull request that broke it; and lands
 the rest with ordinary merge commits, checking after every merge that the base branch holds
-exactly the tree that was gated. The
-scheduling technique inside is a *braided train*: pull requests that do not conflict are
+exactly the tree that was gated. Agents can read queue and hold reasons through `svrf why`, `svrf status`, or the
+stdio MCP interface, then repair their own branches. SVRF retries a held head when
+its consequential inputs change. Its scheduling technique is a *braided train*: pull requests that do not conflict are
 braided into families that gate in parallel; the ones that do conflict wait for a later
 round.
 
@@ -32,6 +32,12 @@ per hour on the same machine, about 47 s of wall time per merged PR, 0.79 gate r
 merged PR with bisection included, and 0 landed-tree mismatches. One day, one repository,
 and the "after" window was arrival-bound: details and caveats in
 [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+> **Release and source:** The latest tagged release is `v0.3.0`. The `main`
+> branch includes subsequent admission, cancellation, retry, and PR-surface
+> changes that are not in that tag. The Action example below pins the tagged
+> release; installing the CLI from the Git URL reads `main`. For reproducible
+> installations, pin a reviewed commit or release tag. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -61,7 +67,7 @@ jobs:
     concurrency: { group: svrf-round, cancel-in-progress: false }
     steps:
       - uses: actions/checkout@v4
-      - uses: nybarius/SVRF@v0.1.0
+      - uses: nybarius/SVRF@v0.3.0
         with:
           github-token: ${{ secrets.SVRF_TOKEN }}   # see docs/GITHUB_SETUP.md for scopes
 ```
@@ -221,6 +227,10 @@ at the gate costs a gate run, plus every speculative family stacked behind it in
 | Branches are updated by refspec push, never forced, never checked out | `RealGit` | |
 | A configured tree provider's tree is used only when it is git's own merge tree for that step; anything else keeps git's tree | `Train.merge_step` | |
 
+The Lean theorems establish invariants of an abstract merge-step model, not a formal
+verification of Git, the Python program, or the complete system. Runtime checks
+compare each observed landed tree with the tree that was gated.
+
 The theorems are about a model of the merge step, not about git. The code never relies
 on the model being right: it reads every landed tree and compares it with the gated one,
 which is exactly the theorems' hypothesis.
@@ -276,7 +286,10 @@ Unknown keys are refused.
 | `history.tests`, `history.docs` | common globs | how paths are classified for the history check |
 | `admission.command` | `""` | extra admission check; exit 0 admits, 126/127 means "could not run" |
 | `admission.watch` | `[]` | paths every hold depends on (requirements, toolchain pins); a base change there rereads every hold |
-| `admission.slots` | `train.jobs` | admission reads (candidates' `admission.command`) run at once, each in its own worktree and admitted by the same `gate.memory_gb`/`memory_reserve_gb` guard as a gate |
+| `admission.slots` | `train.jobs` | concurrent admission reads, with separate worktrees and the same memory guard as gates |
+| `admission.capacity_command` | unset | optional dynamic cap on admission concurrency; unavailable capacity defers admissions rather than guessing |
+| `admission.round_reads` | unset | maximum new admission reads per round; keeps discovery responsive under heavy backlog |
+| `admission.priority_command` | unset | optional priority list, including exact `PR@HEAD` identities (see below); never bypasses admission or gating |
 | `ui.pr_comments` | `true` | one living comment per pull request (see [docs/PR_SURFACE.md](docs/PR_SURFACE.md)) |
 | `ui.status_checks` | `true` | a `svrf` commit status on each candidate head |
 | `ui.dashboard_url` | `""` | optional: linked from the status as `target_url` |
@@ -331,7 +344,7 @@ production; corrections welcome (open an issue).
 | Union-merges configured files instead of conflicting | yes | no | no | no | no | no | no |
 | Compares each landed tree with the gated tree | yes | not documented | not documented | not documented | not documented | not documented | not documented |
 | Re-lands out-of-order histories | yes (optional) | no | no | no | no | no | no |
-| Needs hosted CI minutes | no | yes | yes | yes | yes | yes | no |
+| Needs hosted CI minutes | optional; none when self-hosted | generally yes, depending on configured CI | depends on CI | depends on CI | depends on CI | depends on CI | no hosted CI required |
 
 SVRF is young and single-repository. If your CI is fast relative to your pull-request
 rate, or you're already paying for a GitHub plan that includes it, GitHub's merge queue

@@ -144,6 +144,15 @@ class Admission:
             result = history.verdict(self.git, base, head, self.kind, self.refactor_prefixes)
             if result != "CLEAN":
                 residuals.append(f"history:{result}")
+        union = getattr(self.git, "union", None)
+        if (self.command and merge["status"] == "CONFLICT" and callable(union)
+                and any(union(path) is False for path in merge["conflicts"])):
+            # This fresh native conflict already blocks this exact base/head.
+            # The configured command remains unobserved, not successful.
+            if cancelled is not None and cancelled.is_set():
+                raise ReadFailed("ADMISSION_CANCELLED")
+            return {"verdict": "HELD", "residuals": residuals, "changed": changed,
+                    "native_conflict_base": base, "checks_not_run": ["admission_command"]}
         consumed = None
         if self.command:
             lines, consumed = self._command(head, base, pr, cancelled=cancelled)

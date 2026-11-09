@@ -307,13 +307,13 @@ def hero() -> str:
     out.append('<text class="hx" x="118" y="96" font-size="30" font-weight="750" fill="#ffffff" letter-spacing="-0.5">SVRF</text>')
     out.append('<text class="hx" x="56" y="160" font-size="34" font-weight="700" fill="#ffffff" letter-spacing="-0.8">'
                'The merge queue built for agent swarms</text>')
-    out.append('<text class="hx" x="56" y="200" font-size="19" fill="#b7c4d8">Batches, bisects, and proves every landing.</text>')
+    out.append('<text class="hx" x="56" y="200" font-size="19" fill="#b7c4d8">Batches, bisects, and verifies each landing.</text>')
     for i, word in enumerate(("batch", "gate once", "bisect red", "land + verify")):
         x = 56 + i * 128
         out.append(f'<rect x="{x}" y="236" width="{116}" height="30" rx="15" fill="#ffffff" fill-opacity=".07" '
                    f'stroke="#ffffff" stroke-opacity=".14"/>')
         out.append(f'<text class="hx" x="{x + 58}" y="256" font-size="13.5" fill="#dfe7f3" text-anchor="middle">{word}</text>')
-    return svg(W, H, "SVRF: the merge queue built for agent swarms. Batches, bisects, and proves every landing.",
+    return svg(W, H, "SVRF: the merge queue built for agent swarms. Batches, bisects, and verifies each landing.",
                out, style)
 
 

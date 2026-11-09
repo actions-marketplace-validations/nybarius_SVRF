@@ -8,6 +8,12 @@ from pathlib import Path
 from fakes import Admission, DaemonGitHub, DaemonRepo, FakeGate
 from test_daemon import daemon
 from svrf.errors import ReadFailed
+from svrf.pr_surface import is_surface_comment
+
+
+def published(gh):
+    """The reland's own publications; the hold's surface comment is the hold, not a publication."""
+    return [c for c in gh.comments if not is_surface_comment(c[1])]
 
 
 def world(tmp_path, answer, **kwargs):
@@ -34,7 +40,7 @@ def check_rebuilt_refusal_is_retained_and_the_next_round_is_quiet(tmp_path, resi
     first = owner.tick()
     assert len(calls) == 2
     assert first["held"] == [5]
-    assert (repo.pushes, gh.opened, gh.closed, gh.comments) == ([], [], [], [])
+    assert (repo.pushes, gh.opened, gh.closed, published(gh)) == ([], [], [], [])
     held = json.loads((tmp_path / "state.json").read_text())["held"]["5"]
     assert held["reason"] == "RELAND_ADMISSION_HELD"
     assert held["failing"] == [residual]
@@ -54,7 +60,7 @@ def check_incomplete_rebuilt_read_neither_publishes_nor_enters_held_memory(tmp_p
     assert len(calls) == 2
     assert out["retry_later"]
     assert out["held"] == []
-    assert (repo.pushes, gh.opened, gh.closed, gh.comments) == ([], [], [], [])
+    assert (repo.pushes, gh.opened, gh.closed, published(gh)) == ([], [], [], [])
 
 
 def check_accepted_rebuilt_read_precedes_all_publication_effects(tmp_path):

@@ -18,17 +18,13 @@ in `svrf.toml`:
 - **Write issues** — pull request comments are, on GitHub's API, issue comments; the
   optional round-end comment (`train.comment = true`) needs issues write.
 - **Read metadata** — needed for essentially every other call to resolve the repository.
-- **Checks** are not required. SVRF's gate does not run as a GitHub check by default (see
-  the roadmap item "status checks on pull requests" in the main README); it runs the
-  configured `gate.commands` on the train's own machine. If you separately want GitHub to
-  show a status while a pull request waits, grant checks write too, but SVRF itself does
-  not need it to function.
+- **Commit statuses**: with `ui.status_checks = true` (the default), SVRF posts the `svrf` commit status using `POST /repos/{repo}/statuses/{sha}`. Grant **Commit statuses: Read and write** to the fine-grained token or GitHub App, or disable this optional surface with `ui.status_checks = false`. This is distinct from a GitHub Checks API check run: the actual gate executes `gate.commands` on the train's host.
 
 ## Fine-grained PAT vs. GitHub App
 
 - **Fine-grained personal access token**, scoped to the one repository, with the
   permissions above (Contents: Read and write, Pull requests: Read and write, Issues:
-  Read and write, Metadata: Read-only). This is the simplest route and what
+  Read and write, Metadata: Read-only, Commit statuses: Read and write when enabled). This is the simplest route and what
   `svrf.example.toml` and the Docker/systemd setup assume. Its merges and pushes are
   attributed to the token's owning account.
 - **GitHub App** installed on the repository, with the same permissions. An App's
@@ -75,10 +71,10 @@ SVRF merges a pull request with a REST call pinned to a specific commit sha
 GitHub refuses the merge outright if the head has moved since SVRF read it, which is what
 keeps a merge from landing a tree nobody gated.
 
-If the target repository's branch protection requires status checks to pass before a
-merge is allowed, that requirement applies to this call exactly as it would to a merge
-button click or any other API merge. SVRF does not, by itself, report a GitHub status
-check for the gates it runs (see "checks" above), so one of the following must be true or
+If the target repository's branch protection requires checks to pass before a
+merge, the requirement applies to this call exactly as it would to a merge
+button click or any other API merge. SVRF publishes an optional `svrf` commit status but does not publish the independently
+required CI check names (see "Commit statuses" above), so one of the following must be true or
 every merge attempt will be rejected by branch protection:
 
 - Required status checks are turned off for the merge path SVRF uses (or the repository

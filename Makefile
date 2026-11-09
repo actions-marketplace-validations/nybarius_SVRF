@@ -23,9 +23,20 @@ proofs:
 demo:
 	$(PYTHON) demo/run_demo.py
 
-## docker: build the container image and smoke test it (what CI's "container" job runs)
+## docker: build the container image and smoke test it (what CI's "container" job runs). --load puts the image Buildx
+## built into the engine the smoke test runs on (a docker-container builder otherwise keeps it in its cache, and the
+## smoke test runs whatever older `svrf` image the engine holds). With no DOCKER_HOST, the caller's own rootless Podman
+## socket is used when it exists, so the gate needs no access to the root Docker daemon.
+PODMAN_SOCKET ?= $(XDG_RUNTIME_DIR)/podman/podman.sock
+ifeq ($(DOCKER_HOST),)
+ifneq ($(XDG_RUNTIME_DIR),)
+ifneq ($(wildcard $(PODMAN_SOCKET)),)
+docker: export DOCKER_HOST := unix://$(PODMAN_SOCKET)
+endif
+endif
+endif
 docker:
-	docker build -t svrf .
+	docker build --load -t svrf .
 	docker run --rm --entrypoint svrf svrf --version
 
 ## wheel: build the sdist/wheel (python -m build) and smoke test installing it in a fresh venv

@@ -43,6 +43,7 @@ import hashlib
 from copy import deepcopy
 import json
 import os
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +66,59 @@ SCHEMA = "svrf.receipt/1"
 _receipt_serial = itertools.count()
 
 
+def reason_line(reason: str, paths: list[str], failing: list[str], conflict_with: list[int] | None) -> str:
+    """A one-line, human reason for a hold: what a developer reads in the status and the
+    comment, not the internal reason code."""
+    if conflict_with:
+        where = f" on {paths[0]}" if paths else ""
+        return "conflicts with " + " ".join(f"#{p}" for p in conflict_with) + where
+    if reason == "CONFLICT" and paths:
+        return "conflicts on " + ", ".join(paths[:3])
+    if failing:
+        return pr_surface.one_line(str(failing[0]))
+    return reason.replace("_", " ").lower()
+
+
+def post_surface(gh, call, sha: str, event: dict, *, status_checks: bool, pr_comments: bool,
+                 dashboard_url: str = "", counts: dict | None = None) -> bool:
+    """Post one surface event: the commit status on `sha` and/or the pull request's living
+    comment. Best-effort: a failed read or write is skipped, never raised; the return says
+    whether every requested post was made."""
+    counts = {} if counts is None else counts
+    posted = True
+    if status_checks:
+        state, description = pr_surface.status_line(event)
+        try:
+            call(gh.set_status, sha, state, description, pr_surface.CONTEXT, dashboard_url or None)
+            counts["status"] = counts.get("status", 0) + 1
+        except ReadFailed:
+            posted = False
+    if pr_comments:
+        body = pr_surface.render_comment(event)
+        digest = pr_surface.comment_hash(body)
+        try:
+            comments = call(gh.list_comments, event["number"])
+            existing = next((c for c in comments if pr_surface.is_surface_comment(c.get("body") or "")), None)
+            if existing is not None and pr_surface.comment_hash(existing.get("body") or "") == digest:
+                counts["comment_skip"] = counts.get("comment_skip", 0) + 1
+            elif existing is not None:
+                call(gh.update_comment, existing["id"], body)
+                counts["comment_write"] = counts.get("comment_write", 0) + 1
+            else:
+                call(gh.comment, event["number"], body)
+                counts["comment_write"] = counts.get("comment_write", 0) + 1
+        except ReadFailed:
+            posted = False
+    return posted
+
+
+class _LandingRevisionRefused(ReadFailed):
+    """A received revision refusal before this prepared publication."""
+    def __init__(self, occurrence: int):
+        super().__init__("METON_DECISION_REVISION_CONFLICT")
+        self.occurrence = occurrence
+
+
 class Train:
     def __init__(self, git, github, gate, *, receipts: Path, jobs: int = 1, family_size: int | str = 8,
                  family_cap: int = 8,
@@ -72,10 +126,11 @@ class Train:
                  poll_seconds: float = 5, poll_tries: int = 36, max_rounds: int = 8, dry_run: bool = False,
                  comment: bool = True, is_union: Callable[[str], bool] = lambda p: False,
                  pr_comments: bool = True, status_checks: bool = True, dashboard_url: str = "",
-                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None,
+                 hold_label: str = "train:hold", tree_provider=None, on_receipt=None, landing_decision=None,
                  stop_requested: Callable[[], bool] = lambda: False):
         self.git, self.gh, self.gate = git, github, gate
         self.on_receipt, self._projection_facts = on_receipt, None
+        self.landing_decision = landing_decision
         self.event_owner = process_identity(os.getpid())
         self.jobs, self.memory = max(1, jobs), memory
         self.family_cap = max(1, family_cap)
@@ -135,7 +190,13 @@ class Train:
                          "alerts": self.receipt["alerts"]}
                 if facts != self._projection_facts:
                     try:
-                        self.on_receipt(self.receipt, self.path, hashlib.sha256(raw).hexdigest())
+                        digest = hashlib.sha256(raw).hexdigest()
+                        # Progress keeps its mutable path. A received observation
+                        # keeps the exact inode produced by this atomic save;
+                        # later saves replace only the progress name. Preserve
+                        # the basename used by the existing history projection.
+                        observed = self._retain_receipt(raw)
+                        self.on_receipt(self.receipt, observed, digest)
                     except Exception as error:
                         # A failed observation transport cannot change an original gate or merge.
                         self.receipt["state_projection"] = {
@@ -148,6 +209,120 @@ class Train:
                             pass
                     else:
                         self._projection_facts = deepcopy(facts)
+
+    def _retain_receipt(self, raw: bytes) -> Path:
+        digest = hashlib.sha256(raw).hexdigest()
+        observed = self.path.parent / "observations" / digest / self.path.name
+        observed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(self.path, observed)
+        except FileExistsError:
+            pass
+        if observed.read_bytes() != raw:
+            raise OSError("RECEIPT_OBSERVATION_CHANGED")
+        return observed
+
+    def _retained_landing_revision_refusal(self, result, source):
+        """Validate a configured receiver's explicit refusal and retained bytes.
+
+        The receiver guarantees that its final operation was refused before
+        effects and all earlier primary outcomes are known. This contract permits
+        one fresh decision acquisition, never replay of an unknown operation.
+        The original is opaque here: its receiver owns semantic classification.
+        """
+        try:
+            if (not isinstance(result, dict)
+                    or set(result) != {"schema", "status", "reason", "source", "original"}
+                    or result.get("schema") != "svrf.landing-refusal/v1"
+                    or result.get("status") != "REFUSED_BEFORE_EFFECTS"
+                    or result.get("reason") != "REVISION_CONFLICT"
+                    or result.get("source") != source):
+                return None
+            if len(json.dumps(result, allow_nan=False).encode()) > 1024 * 1024:
+                return None
+            original = result["original"]
+            if not isinstance(original, dict) or set(original) != {"path", "sha256"}:
+                return None
+            name, digest = original["path"], original["sha256"]
+            if (not isinstance(name, str) or not Path(name).is_absolute()
+                    or not isinstance(digest, str) or not digest.startswith("sha256:")
+                    or len(digest) != 71
+                    or any(char not in "0123456789abcdef" for char in digest[7:])):
+                return None
+            # A pipe or device must not turn a bounded evidence read into a wait.
+            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(name, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    return None
+                raw = handle.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != digest[7:]:
+                return None
+            return {"path": name, "sha256": digest}
+        except Exception:
+            return None
+
+    def _receive_landing_decision(self, number: int, current: str, prepared, family: dict):
+        """Consume the configured original receiver, preserving its Meton observation.
+
+        The receiver owns rule evaluation and source/checker qualification. SVRF
+        binds that return to this original gate and exact proposed publication;
+        it never supplies a replacement rule when a configured read is absent.
+        """
+        receiver = self.landing_decision
+        if receiver is None:
+            return None
+        try:
+            raw = self.path.read_bytes()
+            path = self._retain_receipt(raw)
+            saved = json.loads(raw)
+            gate = saved["gates"][family["gate"]]
+            source = {"pr": number, "head": self.rows[number]["head_sha"], "base": current,
+                      "prepared": prepared.commit, "tree": prepared.tree,
+                      "family": family["id"], "family_tree": family["tree"],
+                      "gate_index": family["gate"], "gate": gate,
+                      "receipt": {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}}
+            if (gate != self.receipt["gates"][family["gate"]]
+                    or gate.get("green") is not True or gate.get("read_failure")):
+                raise ReadFailed("METON_GATE_SOURCE_CHANGED")
+            try:
+                result = receiver(deepcopy(source))
+            except _LandingRevisionRefused as error:
+                # Only a returned, validated contract may request continuation.
+                raise ReadFailed("METON_DECISION_UNOBSERVED:" + type(error).__name__) from error
+            except ReadFailed:
+                raise
+            except Exception as error:
+                raise ReadFailed("METON_DECISION_UNOBSERVED:" + type(error).__name__) from error
+            original = self._retained_landing_revision_refusal(result, source)
+            if original is not None:
+                occurrence = len(self.receipt.setdefault("decision_refusals", []))
+                self._add("decision_refusals", {"source": deepcopy(source), "original": original,
+                                                "read_failure": "REVISION_CONFLICT"})
+                raise _LandingRevisionRefused(occurrence)
+            if (not isinstance(result, dict) or result.get("status") != "OBSERVED"
+                    or result.get("source") != source):
+                raise ReadFailed("METON_DECISION_SOURCE_UNOBSERVED")
+            meton = result.get("meton")
+            if (not isinstance(meton, dict)
+                    or not isinstance(meton.get("task"), str) or not meton["task"]
+                    or not isinstance(meton.get("observation"), str)
+                    or not meton["observation"].startswith("sha256:")
+                    or len(meton["observation"]) != 71):
+                raise ReadFailed("METON_OBSERVATION_UNOBSERVED")
+            # Keep nonlanding decisions too. Missing/changed evidence is a next
+            # read for this owner, never a failed original gate or a merge.
+            if len(json.dumps(result, allow_nan=False).encode()) > 1024 * 1024:
+                raise ReadFailed("METON_DECISION_BOUND")
+            index = len(self.receipt.setdefault("decisions", []))
+            self._add("decisions", deepcopy(result))
+            if result.get("action") != "act_land":
+                raise ReadFailed("METON_LANDING_DEFERRED")
+            return index
+        except ReadFailed:
+            raise
+        except Exception as error:
+            raise ReadFailed("METON_DECISION_UNOBSERVED:" + type(error).__name__) from error
 
     def _event(self, kind: str) -> dict:
         return {"kind": kind, "wall": self.clock(), "monotonic": time.monotonic(),
@@ -175,16 +350,7 @@ class Train:
 
     def _reason_line(self, reason: str, paths: list[str], failing: list[str],
                      conflict_with: list[int] | None) -> str:
-        """A one-line, human reason for a hold: what a developer reads in the status and
-        the comment, not the internal reason code."""
-        if conflict_with:
-            where = f" on {paths[0]}" if paths else ""
-            return "conflicts with " + " ".join(f"#{p}" for p in conflict_with) + where
-        if reason == "CONFLICT" and paths:
-            return "conflicts on " + ", ".join(paths[:3])
-        if failing:
-            return pr_surface.one_line(str(failing[0]))
-        return reason.replace("_", " ").lower()
+        return reason_line(reason, paths, failing, conflict_with)
 
     def _surface_event(self, number: int, phase: str, **fields) -> None:
         """Render and post the commit status and/or the living comment for one pull
@@ -202,36 +368,9 @@ class Train:
         sha = self.rows.get(number, {}).get("head_sha")
         if not sha:
             return
-        if self.status_checks:
-            state, description = pr_surface.status_line(event)
-            try:
-                self.call(self.gh.set_status, sha, state, description, pr_surface.CONTEXT,
-                         self.dashboard_url or None)
-                self._surface_calls["status"] += 1
-            except ReadFailed:
-                pass
-        if self.pr_comments:
-            self._upsert_comment(number, event)
-
-    def _upsert_comment(self, number: int, event: dict) -> None:
-        body = pr_surface.render_comment(event)
-        digest = pr_surface.comment_hash(body)
-        try:
-            comments = self.call(self.gh.list_comments, number)
-        except ReadFailed:
-            return
-        existing = next((c for c in comments if pr_surface.is_surface_comment(c.get("body") or "")), None)
-        if existing is not None and pr_surface.comment_hash(existing.get("body") or "") == digest:
-            self._surface_calls["comment_skip"] += 1
-            return
-        try:
-            if existing is not None:
-                self.call(self.gh.update_comment, existing["id"], body)
-            else:
-                self.call(self.gh.comment, number, body)
-            self._surface_calls["comment_write"] += 1
-        except ReadFailed:
-            pass
+        post_surface(self.gh, self.call, sha, event, status_checks=self.status_checks,
+                     pr_comments=self.pr_comments, dashboard_url=self.dashboard_url,
+                     counts=self._surface_calls)
 
     def alert(self, alert: str, **detail) -> None:
         self._add("alerts", {"alert": alert, **detail})
@@ -442,6 +581,7 @@ class Train:
             n = planned["number"]
             rest = [s["number"] for s in steps[index:]]
             row = self.rows[n]
+            defer_decision = False
             try:
                 current = self.git.main_sha()
                 if current != expected:
@@ -463,6 +603,46 @@ class Train:
                                planned=planned["tree"], prepared=prepared.tree)
                     self._stop_family(family, index, "REQUEUED")
                     return False, rest
+                # One fresh decision acquisition may continue this same checked
+                # candidate after an original, explicitly before-effects refusal.
+                for decision_attempt in range(2):
+                    if self.landing_decision is not None:
+                        check_stop(self.stop_requested)
+                    try:
+                        decision_index = self._receive_landing_decision(n, current, prepared, family)
+                        break
+                    except _LandingRevisionRefused:
+                        if decision_attempt:
+                            defer_decision = True
+                            raise
+                        check_stop(self.stop_requested)
+                        if self.git.main_sha() != current:
+                            raise ReadFailed("METON_DECISION_BASE_MOVED")
+                        retry_pull = self.call(self.gh.pull, n)
+                        if retry_pull.get("state") != "open":
+                            raise ReadFailed("METON_DECISION_PR_NOT_OPEN")
+                        if self._publication_withheld(retry_pull, family, index):
+                            return False, rest[1:]
+                        if retry_pull.get("head_sha") != row["head_sha"]:
+                            raise ReadFailed("METON_DECISION_HEAD_MOVED")
+                        check_stop(self.stop_requested)
+                    except ReadFailed:
+                        defer_decision = True
+                        raise
+                if decision_index is not None:
+                    check_stop(self.stop_requested)
+                    # The independent receiving call can outlive a source change.
+                    # Reobserve the same publication immediately before effects.
+                    if self.git.main_sha() != current:
+                        raise ReadFailed("METON_DECISION_BASE_MOVED")
+                    current_pull = self.call(self.gh.pull, n)
+                    if current_pull.get("state") != "open":
+                        raise ReadFailed("METON_DECISION_PR_NOT_OPEN")
+                    if self._publication_withheld(current_pull, family, index):
+                        return False, rest[1:]
+                    if current_pull.get("head_sha") != row["head_sha"]:
+                        raise ReadFailed("METON_DECISION_HEAD_MOVED")
+                    check_stop(self.stop_requested)
                 if prepared.commit != row["head_sha"]:
                     self.git.push_branch(prepared.commit, row["head_ref"])
                 pull = self._await_mergeable(n, prepared.commit)
@@ -475,12 +655,19 @@ class Train:
             except ReadFailed as failure:
                 self.retry_later(n, failure.reason)
                 self._stop_family(family, index, "RETRY")
+                if defer_decision:
+                    # An unread decision is pending, like an unread gate.
+                    # Replanning later families must not repeat this acquisition.
+                    self.receipt["pending"].extend(rest)
+                    return False, []
                 return False, rest
             row["head_sha"] = prepared.commit
             merge_row = {"number": n, "family": family["id"], "gate": family["gate"],
                          "head": prepared.commit, "merge": merged, "parents": [],
                          "gated_tree": planned["tree"], "observed_tree": None, "identity": None,
                          "at": self.clock(), **record, "acknowledged_event": acknowledged_event}
+            if decision_index is not None:
+                merge_row["decision"] = decision_index
             self._add("merges", merge_row)
             observed, parents, unread = self._read_landed(merged)
             merge_row["at"] = self.clock()

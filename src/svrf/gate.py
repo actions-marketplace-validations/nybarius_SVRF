@@ -72,6 +72,8 @@ class MemoryGuard:
         self.available_gb, self.sleep, self.poll = available_gb, sleep, poll
         self.running = 0
         self.lock = threading.Lock()
+        self._changed = threading.Condition(self.lock)
+        self._wait_for_release = sleep is time.sleep
 
     def fits(self, running: int) -> bool:
         return self.available_gb() - self.need_gb * running >= self.need_gb + self.reserve_gb
@@ -84,6 +86,9 @@ class MemoryGuard:
                 if self.fits(self.running):
                     self.running += 1
                     break
+                if self._wait_for_release and self.poll > 0:
+                    self._changed.wait(self.poll)
+                    continue
             self.sleep(self.poll)
         try:
             check_stop(stop_requested)
@@ -91,6 +96,7 @@ class MemoryGuard:
         finally:
             with self.lock:
                 self.running -= 1
+                self._changed.notify_all()
 
 
 class CommandGate:

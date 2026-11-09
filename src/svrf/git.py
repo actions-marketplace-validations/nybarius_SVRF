@@ -116,7 +116,26 @@ class RealGit:
 
     def watch_digest(self, commit: str, paths: list[str], *, payloads=()) -> str:
         """Content at the requested paths, plus requested regular Nymish payload presence."""
-        listing = self._out("ls-tree", "-r", "--full-tree", commit, "--", *sorted(set(paths))) if paths else ""
+        # A consumed directory already reads every selected descendant. Keep the
+        # exact union, rather than paying argv space again for each child. Git
+        # remains the content/mode/absence reader and produces the same listing.
+        family = set(paths)
+        selected = []
+        for name in sorted(family):
+            parents = ["/".join(name.split("/")[:i]) for i in range(1, len(name.split("/")))]
+            if name != "." and "." in family:
+                continue
+            if any(parent in family or (parent + "/" != name and parent + "/" in family)
+                   for parent in parents):
+                continue
+            selected.append(name)
+        try:
+            listing = self._out("ls-tree", "-r", "--full-tree", commit, "--", *selected) if paths else ""
+        except OSError as error:
+            # A finite source family may still exceed the supplied transport.
+            # Preserve an unavailable read; it is neither an empty digest nor a
+            # reason to abandon the coordinator and its original admissions.
+            raise ReadFailed(f"WATCH_PATHS_UNREADABLE:{error.errno}") from error
         if payloads:
             if any(not isinstance(key, str) or not is_base_payload_id(key) for key in payloads):
                 raise ReadFailed("WATCH_PAYLOAD_INVALID")
